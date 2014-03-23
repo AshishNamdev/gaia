@@ -1,4 +1,11 @@
 'use strict';
+/* global fb */
+/* global MockAllFacebookContacts */
+/* global MockContactAllFields */
+/* global MockLinkedContacts */
+
+/* Allow setter without getter */
+/* jshint -W078 */
 
 var FB_ID = 220439;
 
@@ -44,14 +51,13 @@ Mockfb.contacts = function() {
         // Fetch FB data, that is returning a contact info
         this.result = {};
         this.result[FB_ID] = new MockContactAllFields();
-        var deviceContact = this.result[FB_ID];
         this.result[FB_ID].id = '567';
         this.result[FB_ID].familyName = ['Taylor'];
         this.result[FB_ID].givenName = ['Bret'];
         this.result[FB_ID].name = [this.result[FB_ID].givenName + ' ' +
                               this.result[FB_ID].familyName];
         this.result[FB_ID].org[0] = 'FB';
-        this.result[FB_ID].adr[0] = Mockfb.getAddress();
+        this.result[FB_ID].adr = Mockfb.getAddresses();
 
         callback.call(this);
       },
@@ -69,11 +75,11 @@ Mockfb.contacts = function() {
 
 Mockfb.Contact = function(devContact, mozCid) {
   var deviceContact = devContact;
-  var cid = mozCid;
   var contactData;
 
-  if (devContact)
+  if (devContact) {
     setFacebookUid(FB_ID);
+  }
 
   function markAsFb(deviceContact) {
     if (!deviceContact.category) {
@@ -93,8 +99,7 @@ Mockfb.Contact = function(devContact, mozCid) {
     if (!out) {
       if (Mockfb.isFbLinked(data)) {
         out = getLinkedTo(data);
-      }
-      else if (data.category) {
+      } else if (data.category) {
         var idx = data.category.indexOf(fb.CATEGORY);
         if (idx !== -1) {
           out = data.category[idx + 2];
@@ -152,7 +157,7 @@ Mockfb.Contact = function(devContact, mozCid) {
         this.result.name = [this.result.givenName + ' ' +
                               this.result.familyName];
         this.result.org[0] = 'FB';
-        this.result.adr[0] = Mockfb.getAddress();
+        this.result.adr = Mockfb.getAddresses();
 
         callback.call(this);
       },
@@ -185,7 +190,7 @@ Mockfb.Contact = function(devContact, mozCid) {
     deviceContact.name = [deviceContact.givenName + ' ' +
                           deviceContact.familyName];
     deviceContact.org[0] = 'FB';
-    deviceContact.adr[0] = Mockfb.getAddress();
+    deviceContact.adr = Mockfb.getAddresses();
 
     return deviceContact;
   };
@@ -196,7 +201,8 @@ Mockfb.Contact = function(devContact, mozCid) {
         // Fetch FB data, that is returning a contact info
         this.result = [];
         this.result[0] = new MockContactAllFields();
-        this.result[0].adr[0] = Mockfb.getAddress();
+        this.result[0].adr = Mockfb.getAddresses();
+        var date = new Date(0).toString();
         this.result[1] = {
           '+346578888888': true,
           'test@test.com': true,
@@ -204,6 +210,7 @@ Mockfb.Contact = function(devContact, mozCid) {
           'Castilla y León': true,
           'España': true
         };
+        this.result[1][date] = true;
 
         callback.call(this);
       },
@@ -234,20 +241,25 @@ Mockfb.isFbLinked = function(contact) {
   return this.fbLinked;
 };
 
-Mockfb.isEnabled = function() {
-  return this.isEnabled;
-};
-
 Mockfb.getWorksAt = function(fbData) {
   return 'Telefónica';
 };
 
-Mockfb.getAddress = function(fbData) {
-  var out = {};
-  out.type = ['home'];
-  out.locality = 'Palencia';
-  out.region = 'Castilla y León';
-  out.countryName = 'España';
+Mockfb.getAddresses = function(fbData) {
+  var out = [];
+
+  out.push({
+    'type': ['home'],
+    'locality': 'Palencia',
+    'region': 'Castilla y León',
+    'countryName': 'España'
+  });
+  out.push({
+    'type': ['current'],
+    'locality': 'Greater London',
+    'region': 'London',
+    'countryName': 'United Kingdom'
+  });
 
   return out;
 };
@@ -284,6 +296,26 @@ Mockfb.utils = (function() {
       else {
         cbs.success(MockLinkedContacts);
       }
+    },
+
+    getImportChecked: function() {
+
+    },
+
+    setCachedNumFriends: function() {
+
     }
   };
 }());
+
+Mockfb.contacts = {
+  _importedContacts: 40,
+  getLength: function() {
+    return {
+      result: this._importedContacts,
+      set onsuccess(cb) {
+        cb();
+      }
+    };
+  }
+};

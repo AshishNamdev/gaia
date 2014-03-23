@@ -1,4 +1,5 @@
 Calendar.ns('Controllers').Sync = (function() {
+  'use strict';
 
   /**
    * Private helper for choosing how to dispatch errors.
@@ -6,8 +7,9 @@ Calendar.ns('Controllers').Sync = (function() {
    * controller will be invoked.
    */
   function handleError(err, callback) {
-    if (callback)
+    if (callback) {
       return callback(err);
+    }
 
     Calendar.App.errorController.dispatch(err);
   }
@@ -44,6 +46,10 @@ Calendar.ns('Controllers').Sync = (function() {
     _resolvePending: function() {
       if (!(--this.pending)) {
         this.emit('syncComplete');
+      }
+
+      if (this.pending < 0) {
+        dump('\n\n Error calendar sync .pending is < 0 \n\n');
       }
     },
 
@@ -133,8 +139,9 @@ Calendar.ns('Controllers').Sync = (function() {
           if (!(--pending)) {
             self._resolvePending();
 
-            if (callback)
+            if (callback) {
               callback();
+            }
           }
         }
 
@@ -151,7 +158,7 @@ Calendar.ns('Controllers').Sync = (function() {
         }
 
         // find all calendars
-        var calendars = calendarStore.remotesByAccount(
+        calendarStore.remotesByAccount(
           account._id,
           fetchCalendars
         );

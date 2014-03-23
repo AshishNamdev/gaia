@@ -1,6 +1,13 @@
+'use strict';
+
+/* exported MockMozL10n */
+
 var MockMozL10n = {
   get: function get(key) {
     return key;
+  },
+  translate: function(node) {
+
   },
   DateTimeFormat: function() {
     this.localeFormat = function(date, format) {
@@ -10,6 +17,12 @@ var MockMozL10n = {
   language: {
     code: 'en',
     dir: 'ltr'
+  },
+  ready: function(callback) {
+    callback();
+  },
+  localize: function(node, l10nId, l10nArgs) {
+
   }
 };
 
@@ -22,5 +35,8 @@ var MockLazyL10n = {
         return key;
       });
     }
+  },
+  translate: function(node) {
+
   }
 };

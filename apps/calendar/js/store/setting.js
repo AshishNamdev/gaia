@@ -1,4 +1,5 @@
 Calendar.ns('Store').Setting = (function() {
+  'use strict';
 
   function Setting() {
     Calendar.Store.Abstract.apply(this, arguments);
@@ -20,7 +21,8 @@ Calendar.ns('Store').Setting = (function() {
         alarmId: null,
         start: null,
         end: null
-      }
+      },
+      showSwipeToNavigateHint: true
     },
 
     /** disable caching */

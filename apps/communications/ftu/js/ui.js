@@ -1,7 +1,15 @@
+/* global utils, tzSelect,
+          Basket, ConfirmDialog, ScreenLayout,
+          DataMobile, SimManager, SdManager,
+          Navigation, Tutorial, TimeManager,
+          WifiManager, WifiUI, WifiHelper,
+          FxAccountsIACHelper  */
+/* exported UIManager */
 'use strict';
 
-var UIManager = {
+var _;
 
+var UIManager = {
   // As in other Gaia apps, we store all the dom selectors in one
   // place and then camelCase them and attach to the main object,
   // eg. instead of calling document.getElementById('splash-screen')
@@ -10,18 +18,20 @@ var UIManager = {
     'splash-screen',
     'activation-screen',
     'progress-bar',
+    'progress-bar-state',
     'finish-screen',
     'nav-bar',
     'main-title',
     // Unlock SIM Screen
     'unlock-sim-screen',
     'unlock-sim-header',
+    'unlock-sim-back',
     // PIN Screen
     'pincode-screen',
     'pin-label',
     'pin-retries-left',
     'pin-input',
-    'fake-pin-input',
+    'back-sim-button',
     'pin-error',
     'skip-pin-button',
     'unlock-sim-button',
@@ -30,31 +40,49 @@ var UIManager = {
     'puk-label',
     'puk-retries-left',
     'puk-input',
-    'fake-puk-input',
     'puk-info',
     'puk-error',
     'newpin-input',
-    'fake-newpin-input',
     'newpin-error',
     'confirm-newpin-input',
-    'fake-confirm-newpin-input',
     'confirm-newpin-error',
     // XCK Screen
     'xckcode-screen',
     'xck-label',
     'xck-retries-left',
     'xck-input',
-    'fake-xck-input',
     'xck-error',
+    // SIM info
+    'sim-info-screen',
+    'sim-info-back',
+    'sim-info-forward',
+    'sim-info-1',
+    'sim-info-2',
+    'sim-number-1',
+    'sim-number-2',
+    'sim-carrier-1',
+    'sim-carrier-2',
     // Import contacts
+    'sim-import',
     'sim-import-button',
     'no-sim',
     'sd-import-button',
-    'no-sd',
+    'no-memorycard',
+    // Fxa Intro
+    'fxa-create-account',
     // Wifi
     'networks',
     'wifi-refresh-button',
     'wifi-join-button',
+    'join-hidden-button',
+    // Hidden Wifi
+    'hidden-wifi-authentication',
+    'hidden-wifi-ssid',
+    'hidden-wifi-security',
+    'hidden-wifi-password',
+    'hidden-wifi-identity',
+    'hidden-wifi-identity-box',
+    'hidden-wifi-show-password',
     //Date & Time
     'date-configuration',
     'time-configuration',
@@ -63,9 +91,12 @@ var UIManager = {
     'time-form',
     // 3G
     'data-connection-switch',
+    // Geolocation
+    'geolocation-switch',
     // Tutorial
     'tutorial-screen',
     'tutorial-progress',
+    'tutorial-progress-state',
     'lets-go-button',
     'skip-tutorial-button',
     // Privacy Settings
@@ -80,6 +111,8 @@ var UIManager = {
   ],
 
   init: function ui_init() {
+    _ = navigator.mozL10n.get;
+
     // Initialization of the DOM selectors
     this.domSelectors.forEach(function createElementRef(name) {
       this[toCamelCase(name)] = document.getElementById(name);
@@ -91,22 +124,16 @@ var UIManager = {
     this.timeConfigurationLabel.innerHTML = f.localeFormat(currentDate, format);
     this.dateConfigurationLabel.innerHTML = currentDate.
       toLocaleFormat('%Y-%m-%d');
-    // Add events to DOM
-    this.fakePinInput.addEventListener('keypress',
-                                       this.fakeInputValues.bind(this));
-    this.fakePukInput.addEventListener('keypress',
-                                       this.fakeInputValues.bind(this));
-    this.fakeNewpinInput.addEventListener('keypress',
-                                          this.fakeInputValues.bind(this));
-    this.fakeConfirmNewpinInput.addEventListener('keypress',
-                                              this.fakeInputValues.bind(this));
-    this.fakeXckInput.addEventListener('keypress',
-                                       this.fakeInputValues.bind(this));
 
+    // Add events to DOM
     this.simImportButton.addEventListener('click', this);
     this.sdImportButton.addEventListener('click', this);
     this.skipPinButton.addEventListener('click', this);
+    this.backSimButton.addEventListener('click', this);
     this.unlockSimButton.addEventListener('click', this);
+    this.unlockSimBack.addEventListener('click', this);
+    this.simInfoBack.addEventListener('click', this);
+    this.simInfoForward.addEventListener('click', this);
 
     this.dataConnectionSwitch.addEventListener('click', this);
 
@@ -114,9 +141,29 @@ var UIManager = {
     this.wifiJoinButton.addEventListener('click', this);
     this.networks.addEventListener('click', this);
 
+    this.joinHiddenButton.addEventListener('click', this);
+    this.hiddenWifiSecurity.addEventListener('change', this);
+    this.wifiJoinButton.disabled = true;
+
+    this.hiddenWifiPassword.addEventListener('keyup', function() {
+      this.wifiJoinButton.disabled = !WifiHelper.isValidInput(
+        this.hiddenWifiSecurity.value,
+        this.hiddenWifiPassword.value,
+        this.hiddenWifiIdentity.value
+      );
+    }.bind(this));
+
+    this.hiddenWifiShowPassword.onchange = function togglePasswordVisibility() {
+      UIManager.hiddenWifiPassword.type = this.checked ? 'text' : 'password';
+    };
+
     this.timeConfiguration.addEventListener('input', this);
     this.dateConfiguration.addEventListener('input', this);
     this.initTZ();
+
+    this.geolocationSwitch.addEventListener('click', this);
+
+    this.fxaCreateAccount.addEventListener('click', this);
 
     // Prevent form submit in case something tries to send it
     this.timeForm.addEventListener('submit', function(event) {
@@ -124,38 +171,16 @@ var UIManager = {
     });
 
     // Input scroll workaround
-    var top = this.newsletterInput.offsetTop;
     this.newsletterInput.addEventListener('focus', function() {
       window.addEventListener('resize', function resize() {
         window.removeEventListener('resize', resize);
         // Need to wait till resize is done
         setTimeout(function() {
-          document.getElementById('browser_privacy').scrollTop = top;
+          var page = document.getElementById('browser_privacy');
+          UIManager.scrollToElement(page, UIManager.newsletterInput);
         }, 30);
       });
     });
-
-    // Browser privacy newsletter subscription
-    var basketCallback = function(err, data) {
-      utils.overlay.hide();
-      if (err || data.status !== 'ok') {
-        // We don't have any error numbers etc, so we are looking for
-        // 'email address' string in the error description.
-        if (err.desc.indexOf('email address') > -1) {
-          this.invalidEmailErrorDialog.classList.add('visible');
-        } else {
-          // Store locally
-          Basket.store(this.newsletterInput.value, function stored() {
-            UIManager.newsletterSuccessScreen.classList.add('visible');
-          });
-        }
-        return;
-      }
-      // if properly sent, remove stored email (in case of any)
-      window.asyncStorage.removeItem('newsletter_email');
-      this.newsletterForm.classList.add('hidden');
-      this.newsletterSuccessScreen.classList.add('visible');
-    };
 
     this.offlineNewsletterErrorDialog
       .querySelector('button')
@@ -172,13 +197,22 @@ var UIManager = {
         }.bind(this));
 
     this.skipTutorialButton.addEventListener('click', function() {
-      WifiManager.finish();
-      window.close();
+      // For tiny devices
+      if (ScreenLayout.getCurrentLayout() === 'tiny') {
+        WifiManager.finish();
+        window.close();
+      }
+      else {
+        // for large devices
+        Tutorial.jumpToExitStep();
+      }
     });
+
     this.letsGoButton.addEventListener('click', function() {
       UIManager.activationScreen.classList.remove('show');
       UIManager.finishScreen.classList.remove('show');
       UIManager.tutorialScreen.classList.add('show');
+      Tutorial.manageStep();
     });
 
     // Enable sharing performance data (saving to settings)
@@ -188,10 +222,14 @@ var UIManager = {
                             this.onOfflineDialogButtonClick.bind(this));
   },
 
+  scrollToElement: function ui_scrollToElement(container, element) {
+    container.scrollTop = element.offsetTop;
+  },
+
   sendNewsletter: function ui_sendNewsletter(callback) {
     var self = this;
     var emailValue = self.newsletterInput.value;
-    if (emailValue == '') {
+    if (emailValue === '') {
       return callback(true);
     } else {
       utils.overlay.show(_('email-loading'), 'spinner');
@@ -199,7 +237,7 @@ var UIManager = {
         if (window.navigator.onLine) {
           Basket.send(emailValue, function emailSent(err, data) {
             if (err) {
-              if (err.desc && err.desc.indexOf('email address') > -1) {
+              if (err.code && err.code === Basket.errors.INVALID_EMAIL) {
                 ConfirmDialog.show(_('invalid-email-dialog-title'),
                                    _('invalid-email-dialog-text'),
                                    {
@@ -244,32 +282,25 @@ var UIManager = {
     tzSelect(tzRegion, tzCity, this.setTimeZone, this.setTimeZone);
   },
 
-  fakeInputValues: function ui_fakeInputValues(event) {
-    var fakeInput = event.target;
-    var code = event.charCode;
-    if (code === 0 || (code >= 0x30 && code <= 0x39)) {
-      var displayInput =
-              document.getElementById(fakeInput.id.substr(5, fakeInput.length));
-      var content = displayInput.value;
-      if (code === 0) { // backspace
-        content = content.substr(0, content.length - 1);
-      } else {
-        content += String.fromCharCode(code);
-      }
-      displayInput.value = content;
-    }
-    fakeInput.value = '';
-  },
-
   handleEvent: function ui_handleEvent(event) {
     switch (event.target.id) {
       // SIM
       case 'skip-pin-button':
         SimManager.skip();
         break;
+      case 'back-sim-button':
+      case 'sim-info-back':
+        SimManager.back();
+        break;
       case 'unlock-sim-button':
         Navigation.skipped = false;
         SimManager.unlock();
+        break;
+      case 'unlock-sim-back':
+        SimManager.simUnlockBack();
+        break;
+      case 'sim-info-forward':
+        SimManager.finish();
         break;
       case 'sim-import-button':
         // Needed to give the browser the opportunity to properly refresh the UI
@@ -291,7 +322,18 @@ var UIManager = {
         WifiManager.scan(WifiUI.renderNetworks);
         break;
       case 'wifi-join-button':
-        WifiUI.joinNetwork();
+        if (window.location.hash === '#hidden-wifi-authentication') {
+          WifiUI.joinHiddenNetwork();
+        } else {
+          WifiUI.joinNetwork();
+        }
+        break;
+      case 'join-hidden-button':
+        WifiUI.addHiddenNetwork();
+        break;
+      case 'hidden-wifi-security':
+        var securityType = event.target.value;
+        WifiUI.handleHiddenWifiSecurity(securityType);
         break;
       // Date & Time
       case 'time-configuration':
@@ -300,9 +342,17 @@ var UIManager = {
       case 'date-configuration':
         this.setDate();
         break;
+      // Geolocation
+      case 'geolocation-switch':
+        this.updateSetting(event.target.name, event.target.checked);
+        break;
       // Privacy
       case 'share-performance':
-        this.updateSetting(event.target.name, event.target.value);
+        this.updateSetting(event.target.name, event.target.checked);
+        break;
+      // Fxa Intro
+      case 'fxa-create-account':
+        this.createFirefoxAccount();
         break;
       default:
         // wifi selection
@@ -315,10 +365,46 @@ var UIManager = {
 
   updateSetting: function ui_updateSetting(name, value) {
     var settings = window.navigator.mozSettings;
-    if (!name || !settings)
+    if (!name || !settings) {
       return;
+    }
     var cset = {}; cset[name] = value;
     settings.createLock().set(cset);
+  },
+
+  createFirefoxAccount: function ui_createFirefoxAccount() {
+    var fxaDescription = document.getElementById('fxa-intro');
+    var showResponse = function ui_showResponse(response) {
+      if (response && response.done) {
+        // Update the email
+        UIManager.newsletterInput.value = response.email;
+        // Update the string
+        fxaDescription.innerHTML = '';
+        navigator.mozL10n.localize(
+          fxaDescription,
+          'fxa-logged',
+          {
+            email: response.email
+          }
+        );
+        // Disable the button
+        UIManager.fxaCreateAccount.disabled = true;
+      }
+    };
+    var showError = function ui_showError(response) {
+      console.error('Create FxA Error: ' + JSON.stringify(response));
+      // Clean fields
+      UIManager.newsletterInput.value = '';
+      // Reset the field
+      navigator.mozL10n.localize(
+        fxaDescription,
+        'fxa-intro'
+      );
+      // Enable the button
+      UIManager.fxaCreateAccount.disabled = false;
+    };
+
+    FxAccountsIACHelper.openFlow(showResponse, showError);
   },
 
   displayOfflineDialog: function ui_displayOfflineDialog(href, title) {
@@ -337,8 +423,7 @@ var UIManager = {
       return;
     }
 
-    var dateLabel = document.getElementById('this.dateConfigurationLabel');
-     // Current time
+    // Current time
     var now = new Date();
     // Format: 2012-09-01
     var currentDate = this.dateConfiguration.value;
@@ -372,11 +457,15 @@ var UIManager = {
   },
 
   setTimeZone: function ui_stz(timezone) {
-    var utc = 'UTC' + timezone.utcOffset;
+    var utcOffset = timezone.utcOffset;
     document.getElementById('time_zone_overlay').className =
-      utc.replace(/[+:]/g, '');
-    document.getElementById('time-zone-title').textContent =
-      utc + ' ' + timezone.id;
+      'UTC' + utcOffset.replace(/[+:]/g, '');
+    var timezoneTitle = document.getElementById('time-zone-title');
+    navigator.mozL10n.localize(timezoneTitle, 'timezoneTitle', {
+      utcOffset: utcOffset,
+      region: timezone.region,
+      city: timezone.city
+    });
     document.getElementById('tz-region-label').textContent = timezone.region;
     document.getElementById('tz-city-label').textContent = timezone.city;
 

@@ -8,7 +8,7 @@ var BatteryManager = {
   TRANSITION_SPEED: 1.8,
   TRANSITION_FRACTION: 0.30,
 
-  AUTO_SHUTDOWN_LEVEL: 0.02,
+  AUTO_SHUTDOWN_LEVEL: 0.00,
   EMPTY_BATTERY_LEVEL: 0.1,
 
   _battery: window.navigator.battery,
@@ -24,9 +24,10 @@ var BatteryManager = {
     var battery = this._battery;
     if (!battery)
       return;
-
-    if (battery.level <= this.AUTO_SHUTDOWN_LEVEL)
-      SleepMenu.startPowerOff(false);
+    if (battery.level <= this.AUTO_SHUTDOWN_LEVEL && !battery.charging) {
+      // Fire a event to inform SleepMenu perform shutdown.
+      window.dispatchEvent(new CustomEvent('batteryshutdown'));
+    }
   },
 
   init: function bm_init() {
@@ -34,7 +35,7 @@ var BatteryManager = {
     var battery = this._battery;
     if (battery) {
       // When the device is booted, check if the battery is drained.
-      // If so, SleepMenu.startPowerOff() would be called.
+      // If so, batteryshutdown would be triggered to inform SleepMenu shutdown.
       window.addEventListener('homescreen-ready',
                               this.checkBatteryDrainage.bind(this));
 
@@ -276,8 +277,13 @@ var PowerSaveHandler = (function PowerSaveHandler() {
       return;
     }
 
-    SettingsListener.observe('powersave.threshold', 0,
+    SettingsListener.observe('powersave.threshold', -1,
       function getThreshold(value) {
+        // If 'turn on automatically' is set to 'never', don't change the
+        // power saving state
+        if (value == -1)
+          return;
+
         if (battery.level <= value && !_powerSaveEnabled) {
           setMozSettings({'powersave.enabled' : true});
           if (!_powerSaveEnabledLock) {
@@ -287,7 +293,7 @@ var PowerSaveHandler = (function PowerSaveHandler() {
           return;
         }
 
-        if (value != 0 && battery.level > value && _powerSaveEnabled) {
+        if (battery.level > value && _powerSaveEnabled) {
           setMozSettings({'powersave.enabled' : false});
           return;
         }

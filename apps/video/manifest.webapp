@@ -15,7 +15,7 @@
     "settings":{ "access": "readonly" },
     "deprecated-hwvideo":{},
     "audio-channel-content":{},
-    "systemXHR":{}
+    "nfc": { "access": "readwrite" }
   },
   "locales": {
     "ar": {
@@ -37,9 +37,9 @@
   },
   "default_locale": "en-US",
   "icons": {
-    "60": "/style/icons/60/Video.png",
-    "120": "/style/icons/Video.png",
-    "320": "/style/icons/320/Video.png"
+    "60": "/style/icons/Video_60.png",
+    "90": "/style/icons/Video_90.png",
+    "120": "/style/icons/Video_120.png"
   },
   "activities": {
     "pick": {
@@ -52,7 +52,7 @@
     },
     "view" : {
       "filters": {
-        "type": ["video/webm", "video/mp4", "video/3gpp", "video/youtube", "video/ogg"]
+        "type": ["video/webm", "video/mp4", "video/3gpp", "video/ogg", "video/rtsp"]
       },
       "href": "view.html",
       "disposition": "inline",
@@ -60,7 +60,7 @@
     },
     "open" : {
       "filters": {
-        "type": ["video/webm", "video/mp4", "video/3gpp", "video/youtube", "video/ogg"]
+        "type": ["video/webm", "video/mp4", "video/3gpp", "video/ogg"]
       },
       "href": "view.html",
       "disposition": "inline",

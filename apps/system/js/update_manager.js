@@ -170,7 +170,8 @@ var UpdateManager = {
     var _ = navigator.mozL10n.get;
     var self = this;
     this._errorTimeout = setTimeout(function waitForMore() {
-      SystemBanner.show(_('downloadError'));
+      var systemBanner = new SystemBanner();
+      systemBanner.show(_('downloadError'));
       self._errorTimeout = null;
     }, this.NOTIFICATION_BUFFERING_TIMEOUT);
   },
@@ -199,12 +200,12 @@ var UpdateManager = {
   },
 
   showDownloadPrompt: function um_showDownloadPrompt() {
-    var _ = navigator.mozL10n.get;
+    var _localize = navigator.mozL10n.localize;
 
     this._systemUpdateDisplayed = false;
-    this.downloadDialogTitle.textContent = _('numberOfUpdates', {
-                                              n: this.updatesQueue.length
-                                           });
+    _localize(this.downloadDialogTitle, 'numberOfUpdates', {
+      n: this.updatesQueue.length
+    });
 
     var updateList = '';
 
@@ -229,7 +230,7 @@ var UpdateManager = {
       // The user can choose not to update an app
       var checkContainer = document.createElement('label');
       if (updatable instanceof SystemUpdatable) {
-        checkContainer.textContent = _('required');
+        _localize(checkContainer, 'required');
         checkContainer.classList.add('required');
         this._systemUpdateDisplayed = true;
       } else {
@@ -240,6 +241,7 @@ var UpdateManager = {
 
         var span = document.createElement('span');
 
+        checkContainer.classList.add('pack-checkbox');
         checkContainer.appendChild(checkbox);
         checkContainer.appendChild(span);
       }
@@ -248,6 +250,9 @@ var UpdateManager = {
       var name = document.createElement('div');
       name.classList.add('name');
       name.textContent = updatable.name;
+      if (updatable.nameL10nId) {
+        name.dataset.l10nId = updatable.nameL10nId;
+      }
       listItem.appendChild(name);
 
       if (updatable.size) {
@@ -317,30 +322,26 @@ var UpdateManager = {
   },
 
   render: function um_render() {
-    var _ = navigator.mozL10n.get;
+    var _localize = navigator.mozL10n.localize;
 
-    this.toasterMessage.innerHTML =
-      _('updateAvailableInfo', {
-        n: this.updatesQueue.length - this.lastUpdatesAvailable
-      });
+    _localize(this.toasterMessage, 'updateAvailableInfo', {
+      n: this.updatesQueue.length - this.lastUpdatesAvailable
+    });
 
-    var message = '';
     if (this._downloading) {
       if (this._uncompressing && this.downloadsQueue.length === 1) {
-        message = _('uncompressingMessage');
+        _localize(this.message, 'uncompressingMessage');
       } else {
-        var humanProgress = this._humanizeSize(this._downloadedBytes);
-        message = _('downloadingUpdateMessage', {
-                    progress: humanProgress
-                  });
+        _localize(this.message, 'downloadingUpdateMessage', {
+          progress: this._humanizeSize(this._downloadedBytes)
+        });
       }
     } else {
-      message = _('updateAvailableInfo', {
-                 n: this.updatesQueue.length
-                });
+      _localize(this.message, 'updateAvailableInfo', {
+        n: this.updatesQueue.length
+      });
     }
 
-    this.message.innerHTML = message;
     var css = this.container.classList;
     this._downloading ? css.add('downloading') : css.remove('downloading');
   },

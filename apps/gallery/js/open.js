@@ -40,12 +40,20 @@ window.addEventListener('localized', function() {
 
       // And register event handlers for gestures
       frame = new MediaFrame($('frame'), false);
+
+      if (CONFIG_REQUIRED_EXIF_PREVIEW_WIDTH) {
+        frame.setMinimumPreviewSize(CONFIG_REQUIRED_EXIF_PREVIEW_WIDTH,
+                                    CONFIG_REQUIRED_EXIF_PREVIEW_HEIGHT);
+      }
+
       var gestureDetector = new GestureDetector(frame.container);
       gestureDetector.startDetecting();
       frame.container.addEventListener('dbltap', handleDoubleTap);
       frame.container.addEventListener('transform', handleTransform);
       frame.container.addEventListener('pan', handlePan);
       frame.container.addEventListener('swipe', handleSwipe);
+
+      window.addEventListener('resize', frame.resize.bind(frame));
 
       // Report errors if we're passed an invalid image
       frame.onerror = function invalid() {
@@ -61,27 +69,8 @@ window.addEventListener('localized', function() {
     // We'll enable it below in the open() function if needed.
     $('menu').hidden = true;
 
-    // When an image file is received via bluetooth, we're invoked
-    // by the system app. But the blob that is passed has a very large
-    // invalid size field. See bug 850941. As a workaround, we use
-    // the filename that is passed along with the blob and look the file
-    // up via device storage.  When bug 850941 is fixed, we can remove
-    // this code and replace it with open(blob);
     blob = activityData.blob;
-    var filename = activityData.filename;
-    if (filename && (!blob || blob.size > 25000000)) {
-      var getrequest = navigator.getDeviceStorage('pictures').get(filename);
-      getrequest.onsuccess = function() {
-        open(getrequest.result); // this blob should have a valid size and type
-      };
-      getrequest.onerror = function() {
-        // if the file didn't exist, then try the blob
-        open(blob);
-      };
-    }
-    else {
-      open(blob);
-    }
+    open(blob);
   }
 
   // Display the specified blob, unless it is too big to display
@@ -90,7 +79,7 @@ window.addEventListener('localized', function() {
     // If the app that initiated this activity wants us to do allow the
     // user to save this blob as a file, and if device storage is available
     // and if there is enough free space, then display a save button.
-    if (activityData.allowSave && activityData.filename) {
+    if (activityData.allowSave && activityData.filename && checkFilename()) {
       getStorageIfAvailable('pictures', blob.size, function(ds) {
         storage = ds;
         $('menu').hidden = false;
@@ -114,7 +103,12 @@ window.addEventListener('localized', function() {
       // If there was no EXIF preview, or if the image is not very big,
       // display the full-size image.
       if (!metadata.preview || pixels < 512 * 1024) {
-        frame.displayImage(blob, metadata.width, metadata.height);
+        frame.displayImage(blob,
+                           metadata.width,
+                           metadata.height,
+                           null,
+                           metadata.rotation,
+                           metadata.mirrored);
       }
       else {
         // If we found an EXIF preview, and can determine its size, then
@@ -132,14 +126,18 @@ window.addEventListener('localized', function() {
                             metadata.preview.width = previewmetadata.width;
                             metadata.preview.height = previewmetadata.height;
                             frame.displayImage(blob,
-                                               metadata.width, metadata.height,
-                                               metadata.preview);
+                                               metadata.width,
+                                               metadata.height,
+                                               metadata.preview,
+                                               metadata.rotation,
+                                               metadata.mirrored);
                           },
                           function error() {
                             // If we couldn't parse the preview image,
                             // just display full-size.
                             frame.displayImage(blob,
-                                               metadata.width, metadata.height);
+                                               metadata.width,
+                                               metadata.height);
                           });
       }
     }
@@ -159,6 +157,16 @@ window.addEventListener('localized', function() {
       else {
         displayError('imagetoobig');
       }
+    }
+  }
+
+  function checkFilename() {
+    var dotIdx = activityData.filename.lastIndexOf('.');
+    if (dotIdx > -1) {
+      var ext = activityData.filename.substr(dotIdx + 1);
+      return MimeMapper.guessTypeFromExtension(ext) === blob.type;
+    } else {
+      return false;
     }
   }
 

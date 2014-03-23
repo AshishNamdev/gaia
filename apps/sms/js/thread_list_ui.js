@@ -1,18 +1,35 @@
 /* -*- Mode: js; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- /
 /* vim: set shiftwidth=2 tabstop=2 autoindent cindent expandtab: */
 
+/*global Template, Utils, Threads, Contacts, Threads,
+         WaitingScreen, MozSmsFilter, MessageManager, TimeHeaders,
+         Drafts, Thread, ThreadUI, OptionMenu, ActivityPicker,
+         PerformanceTestingHelper, StickyHeader */
+
+/*exported ThreadListUI */
+(function(exports) {
 'use strict';
 
 var ThreadListUI = {
+  draftLinks: null,
+  draftRegistry: null,
+  DRAFT_SAVED_DURATION: 5000,
+
+  // Used to track timeouts
+  timeouts: {
+    onDraftSaved: null
+  },
+
   // Used to track the current number of rendered
   // threads. Updated in ThreadListUI.renderThreads
   count: 0,
 
-  init: function thlui_init() {
-    var _ = navigator.mozL10n.get;
+  // Set to |true| when in edit mode
+  inEditMode: false,
 
+  init: function thlui_init() {
     this.tmpl = {
-      thread: Utils.Template('messages-thread-tmpl')
+      thread: Template('messages-thread-tmpl')
     };
 
     // TODO: https://bugzilla.mozilla.org/show_bug.cgi?id=854413
@@ -20,13 +37,14 @@ var ThreadListUI = {
       'container', 'no-messages',
       'check-all-button', 'uncheck-all-button',
       'delete-button', 'cancel-button',
-      'edit-icon', 'edit-mode', 'edit-form'
+      'options-icon', 'edit-mode', 'edit-form', 'draft-saved-banner'
     ].forEach(function(id) {
       this[Utils.camelCase(id)] = document.getElementById('threads-' + id);
     }, this);
 
+    this.mainWrapper = document.getElementById('main-wrapper');
+
     this.delNumList = [];
-    this.fullHeight = this.container.offsetHeight;
 
     this.checkAllButton.addEventListener(
       'click', this.toggleCheckedAll.bind(this, true)
@@ -41,7 +59,11 @@ var ThreadListUI = {
     );
 
     this.cancelButton.addEventListener(
-      'click', this.cancelEditMode.bind(this)
+      'click', this.cancelEdit.bind(this)
+    );
+
+    this.optionsIcon.addEventListener(
+      'click', this.showOptions.bind(this)
     );
 
     this.container.addEventListener(
@@ -51,6 +73,27 @@ var ThreadListUI = {
     this.editForm.addEventListener(
       'submit', this
     );
+
+    navigator.mozContacts.addEventListener(
+      'contactchange',
+      this.updateContactsInfo.bind(this)
+    );
+
+    this.draftLinks = new Map();
+    ThreadListUI.draftRegistry = {};
+
+    this.sticky =
+      new StickyHeader(this.container, document.getElementById('sticky'));
+  },
+
+  getAllInputs: function thlui_getAllInputs() {
+    if (this.container) {
+      return Array.prototype.slice.call(
+        this.container.querySelectorAll('input[type=checkbox]')
+      );
+    } else {
+      return [];
+    }
   },
 
   getSelectedInputs: function thlui_getSelectedInputs() {
@@ -65,32 +108,39 @@ var ThreadListUI = {
 
   setContact: function thlui_setContact(node) {
     var thread = Threads.get(node.dataset.threadId);
+    var draft = Drafts.get(node.dataset.threadId);
     var number, others;
 
-    if (!thread) {
+    if (thread) {
+      number = thread.participants[0];
+      others = thread.participants.length - 1;
+    } else if (draft) {
+      number = draft.recipients[0];
+      others = draft.recipients.length - 1;
+    } else {
+      console.error(
+        'This node does not look like a displayed list item: ',
+        node.dataset.threadId
+      );
       return;
     }
-
-    number = thread.participants[0];
-    others = thread.participants.length - 1;
 
     if (!number) {
+      navigator.mozL10n.localize(
+        node.querySelector('.name'), 'no-recipient'
+      );
       return;
     }
-
-    // TODO: This should use SimplePhoneMatcher
 
     Contacts.findByPhoneNumber(number, function gotContact(contacts) {
       var name = node.getElementsByClassName('name')[0];
-      var photo = node.getElementsByTagName('img')[0];
-
-      // TODO: Fix This, https://bugzilla.mozilla.org/show_bug.cgi?id=873703
-      var plural = others && others > 0 ?
-        (others > 1 ? '[many]' : '[one]') : '[zero]';
+      var photo = node.querySelector('span[data-type=img]');
       var title, src, details;
 
       if (contacts && contacts.length) {
-        details = Utils.getContactDetails(number, contacts[0]);
+        details = Utils.getContactDetails(number, contacts[0], {
+          photoURL: true
+        });
         title = details.title || number;
         src = details.photoURL || '';
       } else {
@@ -99,68 +149,68 @@ var ThreadListUI = {
       }
 
       if (src) {
-        photo.onload = photo.onerror = function revokePhotoURL() {
-          this.onload = this.onerror = null;
-          URL.revokeObjectURL(this.src);
-        };
+        Utils.asyncLoadRevokeURL(src);
       }
 
-      name.textContent = navigator.mozL10n.get('contact-title-text' + plural, {
+      navigator.mozL10n.localize(name, 'thread-header-text', {
         name: title,
         n: others
       });
 
-      photo.src = src;
+      photo.style.backgroundImage = 'url(' + src + ')';
     });
   },
 
-  handleEvent: function thlui_handleEvent(evt) {
-    switch (evt.type) {
+  handleEvent: function thlui_handleEvent(event) {
+    var draftId;
+
+    switch (event.type) {
       case 'click':
         // Duck type determination; if the click event occurred on
         // a target with a |type| property, then assume it could've
         // been a checkbox and proceed w/ validation condition
-        if (evt.target.type && evt.target.type === 'checkbox') {
-          ThreadListUI.checkInputs();
+        if (event.target.type && event.target.type === 'checkbox') {
+          this.checkInputs();
         }
+
+        if ((draftId = this.draftLinks.get(event.target))) {
+          ThreadUI.draft = Drafts.get(draftId);
+        }
+
         break;
       case 'submit':
-        evt.preventDefault();
+        event.preventDefault();
         break;
     }
   },
 
   checkInputs: function thlui_checkInputs() {
-    var _ = navigator.mozL10n.get;
     var selected = ThreadListUI.selectedInputs.length;
 
-    if (selected === ThreadListUI.counter) {
+    if (selected === ThreadListUI.allInputs.length) {
       this.checkAllButton.disabled = true;
     } else {
       this.checkAllButton.disabled = false;
     }
     if (selected) {
       this.uncheckAllButton.disabled = false;
-      this.deleteButton.disabled = false;
-      this.editMode.innerHTML = _('selected', {n: selected});
+      this.deleteButton.classList.remove('disabled');
+      navigator.mozL10n.localize(this.editMode, 'selected', {n: selected});
     } else {
       this.uncheckAllButton.disabled = true;
-      this.deleteButton.disabled = true;
-      this.editMode.innerHTML = _('editMode');
+      this.deleteButton.classList.add('disabled');
+      navigator.mozL10n.localize(this.editMode, 'deleteMessages-title');
     }
   },
 
   cleanForm: function thlui_cleanForm() {
-    var inputs = this.container.querySelectorAll(
-      'input[type="checkbox"]'
-    );
+    var inputs = this.allInputs;
     var length = inputs.length;
     for (var i = 0; i < length; i++) {
       inputs[i].checked = false;
       inputs[i].parentNode.parentNode.classList.remove('undo-candidate');
     }
     this.delNumList = [];
-    this.editMode.textContent = navigator.mozL10n.get('editMode');
     this.checkInputs();
   },
 
@@ -179,29 +229,96 @@ var ThreadListUI = {
     this.checkInputs();
   },
 
-  removeThread: function(threadId) {
+  removeThread: function thlui_removeThread(threadId) {
     var li = document.getElementById('thread-' + threadId);
-    li.parentNode.removeChild(li);
+    var parent, draftId;
+
+    if (li) {
+      parent = li.parentNode;
+      li.remove();
+    }
+
+    if ((draftId = this.draftLinks.get(li))) {
+      this.draftLinks.delete(li);
+
+      delete this.draftRegistry[draftId];
+    }
+
+    // remove the header and the ul for an empty list
+    if (parent && !parent.firstElementChild) {
+      parent.previousSibling.remove();
+      parent.remove();
+
+      this.sticky.refresh();
+
+      // if we have no more elements, set empty classes
+      if (!this.container.querySelector('li')) {
+        this.setEmpty(true);
+      }
+    }
   },
 
   delete: function thlui_delete() {
     var question = navigator.mozL10n.get('deleteThreads-confirmation2');
-    var messageIds = [];
-    var threadIds, threadId, filter;
+    var list, length, id, threadId, filter, count;
+
+    function checkDone(threadId) {
+      /* jshint validthis: true */
+      // Threads.delete will handle deleting
+      // any Draft objects associated with the
+      // specified threadId.
+      Threads.delete(threadId);
+
+      // Cleanup the DOM
+      this.removeThread(threadId);
+
+      if (--count === 0) {
+        this.cancelEdit();
+        Drafts.store();
+        WaitingScreen.hide();
+      }
+    }
+
+    function deleteMessage(message) {
+      MessageManager.deleteMessage(message.id);
+      return true;
+    }
 
     if (confirm(question)) {
       WaitingScreen.show();
 
-      threadIds = this.selectedInputs.map(function(input) {
-        return input.value;
-      });
+      list = this.selectedInputs.reduce(function(list, input) {
+        list[input.dataset.mode].push(+input.value);
+        return list;
+      }, { drafts: [], threads: [] });
+
+      if (list.drafts.length) {
+        length = list.drafts.length;
+
+        for (var i = 0; i < length; i++) {
+          id = list.drafts[i];
+          Drafts.delete(Drafts.get(id));
+          this.removeThread(id);
+        }
+
+        Drafts.store();
+
+        // In cases where no threads are being deleted,
+        // reset and restore the UI from edit mode and
+        // exit immediately.
+        if (list.threads.length === 0) {
+          this.cancelEdit();
+          WaitingScreen.hide();
+          return;
+        }
+      }
+
+      count = list.threads.length;
 
       // Remove and coerce the threadId back to a number
       // MozSmsFilter and all other platform APIs
       // expect this value to be a number.
-      while (threadId = +threadIds.pop()) {
-        // Cleanup the DOM
-        this.removeThread(threadId);
+      while ((threadId = +list.threads.pop())) {
 
         // Filter and request all messages with this threadId
         filter = new MozSmsFilter();
@@ -210,171 +327,308 @@ var ThreadListUI = {
         MessageManager.getMessages({
           filter: filter,
           invert: true,
-          each: function each(message) {
-            MessageManager.deleteMessage(message.id);
-            return true;
-          },
-          end: function end() {
-            Threads.delete(threadId);
-
-            // When the last threadId has been cleared...
-            if (!threadIds.length) {
-              ThreadListUI.editDone = true;
-              window.location.hash = '#thread-list';
-            }
-          }
+          each: deleteMessage,
+          end: checkDone.bind(this, threadId)
         });
       }
     }
   },
 
-  cancelEditMode: function thlui_cancelEditMode() {
-    window.location.hash = '#thread-list';
+  setEmpty: function thlui_setEmpty(empty) {
+    var addWhenEmpty = empty ? 'add' : 'remove';
+    var removeWhenEmpty = empty ? 'remove' : 'add';
+
+    ThreadListUI.noMessages.classList[removeWhenEmpty]('hide');
+    ThreadListUI.container.classList[addWhenEmpty]('hide');
   },
 
-  renderThreads: function thlui_renderThreads(threads, renderCallback) {
-
-    // shut down this render
-    var abort = false;
-
-    // we store the function to kill the previous render on the function itself
-    if (thlui_renderThreads.abort) {
-      thlui_renderThreads.abort();
-    }
-
-
-    // TODO: https://bugzilla.mozilla.org/show_bug.cgi?id=854417
-    // Refactor the rendering method: do not empty the entire
-    // list on every render.
-    ThreadListUI.container.innerHTML = '';
-    ThreadListUI.counter = threads.length;
-
-    if (threads.length) {
-      thlui_renderThreads.abort = function thlui_renderThreads_abort() {
-        abort = true;
-      };
-      // There are messages to display.
-      //  1. Add the "hide" class to the threads-no-messages display
-      //  2. Remove the "hide" class from the view
-      //
-      ThreadListUI.noMessages.classList.add('hide');
-      ThreadListUI.container.classList.remove('hide');
-      ThreadListUI.editIcon.classList.remove('disabled');
-
-      FixedHeader.init('#threads-container',
-                       '#threads-header-container',
-                       'header');
-      // Edit mode available
-
-      var appendThreads = function(threads, callback) {
-        if (!threads.length) {
-          if (callback) {
-            callback();
-          }
-          return;
+  showOptions: function thlui_options() {
+    var params = {
+      items: [{
+        l10nId: 'settings',
+        method: function oSettings() {
+          ActivityPicker.openSettings();
         }
+      },{ // Last item is the Cancel button
+        l10nId: 'cancel',
+        incomplete: true
+      }]
+    };
 
-        setTimeout(function appendThreadsDelayed() {
-          if (abort) {
-            return;
-          }
-          ThreadListUI.appendThread(threads.pop());
-          appendThreads(threads, callback);
-        });
-      };
-
-      appendThreads(threads, function at_callback() {
-        // Refresh fixed header logic
-        FixedHeader.refresh();
-        // clear up abort method
-        delete thlui_renderThreads.abort;
-        // Boot update of headers
-        Utils.updateTimeHeaders();
-        // Once the rendering it's done, callback if needed
-        if (renderCallback) {
-          renderCallback();
-        }
+    // Add delete option when list is not empty 
+    if (ThreadListUI.noMessages.classList.contains('hide')) {
+      params.items.unshift({
+        l10nId: 'deleteMessages-label',
+        method: this.startEdit.bind(this)
       });
-    } else {
-      // There are no messages to display.
-      //  1. Remove the "hide" class from threads-no-messages display
-      //  2. Add the "hide" class to the view
-      //
-      ThreadListUI.noMessages.classList.remove('hide');
-      ThreadListUI.container.classList.add('hide');
-      ThreadListUI.editIcon.classList.add('disabled');
-
-      // Callback if exist
-      if (renderCallback) {
-        setTimeout(function executeCB() {
-          renderCallback();
-        });
-      }
     }
+
+    new OptionMenu(params).show();
   },
 
-  createThread: function thlui_createThread(thread) {
+  startEdit: function thlui_edit() {
+    this.inEditMode = true;
+    this.cleanForm();
+    this.mainWrapper.classList.toggle('edit');
+  },
+
+  cancelEdit: function thlui_cancelEdit() {
+    this.inEditMode = false;
+    this.mainWrapper.classList.remove('edit');
+  },
+
+  renderDrafts: function thlui_renderDrafts() {
+    // Request and render all threads with drafts
+    // or thread-less drafts.
+    Drafts.request(function() {
+      Drafts.forEach(function(draft, threadId) {
+        if (threadId) {
+          // Find draft-containing threads that have already been rendered
+          // and update them so they mark themselves appropriately
+          var el = document.getElementById('thread-' + threadId);
+          if (el) {
+            this.updateThread(Threads.get(threadId));
+          }
+        } else {
+          // Safely assume there is a threadless draft
+          this.setEmpty(false);
+
+          // If there is currently no list item rendered for this
+          // draft, then proceed.
+          if (!this.draftRegistry[draft.id]) {
+            this.appendThread(
+              Thread.create(draft)
+            );
+          }
+        }
+      }, this);
+
+      this.sticky.refresh();
+    }.bind(this));
+  },
+
+  prepareRendering: function thlui_prepareRendering() {
+    this.container.innerHTML = '';
+    this.renderDrafts();
+  },
+
+  startRendering: function thlui_startRenderingThreads() {
+    this.setEmpty(false);
+  },
+
+  finalizeRendering: function thlui_finalizeRendering(empty) {
+    if (empty) {
+      this.setEmpty(true);
+    }
+
+    if (!empty) {
+      TimeHeaders.updateAll('header[data-time-update]');
+    }
+
+    this.sticky.refresh();
+  },
+
+  renderThreads: function thlui_renderThreads(done) {
+    PerformanceTestingHelper.dispatch('will-render-threads');
+
+    var hasThreads = false;
+    var firstPanelCount = 9; // counted on a Peak
+
+    this.prepareRendering();
+
+    function onRenderThread(thread) {
+      /* jshint validthis: true */
+      if (!hasThreads) {
+        hasThreads = true;
+        this.startRendering();
+      }
+
+      this.appendThread(thread);
+      if (--firstPanelCount === 0) {
+        PerformanceTestingHelper.dispatch('above-the-fold-ready');
+      }
+    }
+
+    function onThreadsRendered() {
+      /* jshint validthis: true */
+
+      /* We set the view as empty only if there's no threads and no drafts,
+       * this is done to prevent races between renering threads and drafts. */
+      this.finalizeRendering(!(hasThreads || Drafts.size));
+
+      PerformanceTestingHelper.dispatch('startup-path-done');
+    }
+
+    var renderingOptions = {
+      each: onRenderThread.bind(this),
+      end: onThreadsRendered.bind(this),
+      done: done
+    };
+
+    MessageManager.getThreads(renderingOptions);
+  },
+
+  createThread: function thlui_createThread(record) {
     // Create DOM element
     var li = document.createElement('li');
-    var timestamp = thread.timestamp.getTime();
-    var lastMessageType = thread.lastMessageType;
-    var participants = thread.participants;
+    var timestamp = +record.timestamp;
+    var type = record.lastMessageType;
+    var participants = record.participants;
     var number = participants[0];
-    var body = thread.body || '';
-    var id = thread.id;
+    var id = record.id;
+    var bodyHTML = record.body;
+    var thread = Threads.get(id);
+    var draft, draftId;
+
+    // A new conversation "is" a draft
+    var isDraft = typeof thread === 'undefined';
+
+    // A an existing conversation "has" a draft
+    // (or it doesn't, depending on the value
+    // returned by thread.hasDrafts)
+    var hasDrafts = isDraft ? false : thread.hasDrafts;
+
+    if (hasDrafts) {
+      draft = Drafts.byThreadId(thread.id).latest;
+      timestamp = Math.max(draft.timestamp, timestamp);
+      // If the draft is newer than the message, update
+      // the body with the draft content's first string.
+      if (draft.timestamp >= record.timestamp) {
+        bodyHTML = draft.content.find(function(content) {
+          if (typeof content === 'string') {
+            return true;
+          }
+        });
+        type = draft.type;
+      }
+    }
+
+    bodyHTML = Template.escape(bodyHTML || '');
 
     li.id = 'thread-' + id;
     li.dataset.threadId = id;
     li.dataset.time = timestamp;
-    li.dataset.lastMessageType = lastMessageType;
+    li.dataset.lastMessageType = type;
 
-
-    if (thread.unreadCount > 0) {
+    if (record.unreadCount > 0) {
       li.classList.add('unread');
     }
 
-    // Since getThreads returns a DOMStringMap,
-    // |undefined| has become a string instead of a value
-    //
-    // TODO: Fix this, https://bugzilla.mozilla.org/show_bug.cgi?id=873706
-    if (body === 'undefined') {
-      body = '&nbsp;';
-    }
+    if (hasDrafts || isDraft) {
+      // Set the "draft" visual indication
+      li.classList.add('draft');
 
-    if (lastMessageType === 'sms' && body) {
-      body = Utils.Message.format(body).split('\n')[0];
+      if (hasDrafts) {
+        li.classList.add('has-draft');
+      } else {
+        li.classList.add('is-draft');
+      }
+
+
+      draftId = hasDrafts ? draft.id : record.id;
+
+      // Used in renderDrafts as an efficient mechanism
+      // for checking whether a draft of a specific ID
+      // has been rendered.
+      this.draftRegistry[draftId] = true;
     }
 
     // Render markup with thread data
     li.innerHTML = this.tmpl.thread.interpolate({
-      id: id,
+      hash: isDraft ? '#new' : '#thread=' + id,
+      mode: isDraft ? 'drafts' : 'threads',
+      id: isDraft ? draftId : id,
       number: number,
-      body: body,
-      formattedDate: Utils.getFormattedHour(timestamp)
+      bodyHTML: bodyHTML,
+      timestamp: String(timestamp)
     }, {
-      safe: ['id', 'body']
+      safe: ['id', 'bodyHTML']
     });
+
+    TimeHeaders.update(li.querySelector('time'));
+
+    if (draftId) {
+      // Used in handleEvent to set the ThreadUI.draft object
+      this.draftLinks.set(
+        li.querySelector('a'), draftId
+      );
+    }
 
     return li;
   },
+
   insertThreadContainer:
-    function thlui_insertThreadContainer(fragment, timestamp) {
+    function thlui_insertThreadContainer(group, timestamp) {
     // We look for placing the group in the right place.
     var headers = ThreadListUI.container.getElementsByTagName('header');
     var groupFound = false;
     for (var i = 0; i < headers.length; i++) {
       if (timestamp >= headers[i].dataset.time) {
         groupFound = true;
-        ThreadListUI.container.insertBefore(fragment, headers[i]);
+        ThreadListUI.container.insertBefore(group, headers[i].parentNode);
         break;
       }
     }
     if (!groupFound) {
-      ThreadListUI.container.appendChild(fragment);
+      ThreadListUI.container.appendChild(group);
     }
   },
+
+  updateThread: function thlui_updateThread(record, options) {
+    var thread = Thread.create(record, options);
+    var threadUINode = document.getElementById('thread-' + thread.id);
+    var threadUITime = threadUINode ? +threadUINode.dataset.time : NaN;
+    var recordTime = +thread.timestamp;
+
+    // For legitimate in-memory thread objects, update the stored
+    // Thread instance with the newest data. This check prevents
+    // draft objects from inadvertently creating bogus thread
+    // objects.
+    if (Threads.has(thread.id)) {
+      Threads.set(thread.id, thread);
+    }
+
+    // Edge case: if we just received a message that is older than the latest
+    // one in the thread, we only need to update the 'unread' status.
+    var newMessageReceived = options && options.unread;
+    if (newMessageReceived && threadUITime > recordTime) {
+      this.mark(thread.id, 'unread');
+      return;
+    }
+
+    // If we just deleted messages in a thread but kept the last message
+    // unchanged, we don't need to update the thread UI.
+    var messagesDeleted = options && options.deleted;
+    if (messagesDeleted && threadUITime === recordTime) {
+      return;
+    }
+
+    // General case: update the thread UI.
+    if (threadUINode) {
+      // remove the current thread node in order to place the new one properly
+      this.removeThread(thread.id);
+    }
+    this.appendThread(thread);
+    this.setEmpty(false);
+    this.sticky.refresh();
+  },
+
+  onMessageSending: function thlui_onMessageSending(message) {
+    this.updateThread(message);
+  },
+
+  onMessageReceived: function thlui_onMessageReceived(message) {
+    this.updateThread(message, { unread: true });
+  },
+
   appendThread: function thlui_appendThread(thread) {
-    var timestamp = thread.timestamp.getTime();
+    var timestamp = +thread.timestamp;
+    var drafts = Drafts.byThreadId(thread.id);
+
+    if (drafts.length) {
+      timestamp = Math.max(drafts.latest.timestamp, timestamp);
+    }
+
     // We create the DOM element of the thread
     var node = this.createThread(thread);
 
@@ -383,17 +637,17 @@ var ThreadListUI = {
 
     // Is there any container already?
     var threadsContainerID = 'threadsContainer_' +
-                              Utils.getDayDate(thread.timestamp);
+                              Utils.getDayDate(timestamp);
     var threadsContainer = document.getElementById(threadsContainerID);
     // If there is no container we create & insert it to the DOM
     if (!threadsContainer) {
-      // We create the fragment with groul 'header' & 'ul'
-      var threadsContainerFragment =
+      // We create the wrapper with a 'header' & 'ul'
+      var threadsContainerWrapper =
         ThreadListUI.createThreadContainer(timestamp);
       // Update threadsContainer with the new value
-      threadsContainer = threadsContainerFragment.childNodes[1];
-      // Place our new fragment in the DOM
-      ThreadListUI.insertThreadContainer(threadsContainerFragment, timestamp);
+      threadsContainer = threadsContainerWrapper.childNodes[1];
+      // Place our new content in the DOM
+      ThreadListUI.insertThreadContainer(threadsContainerWrapper, timestamp);
     }
 
     // Where have I to place the new thread?
@@ -406,20 +660,26 @@ var ThreadListUI = {
         break;
       }
     }
+
     if (!threadFound) {
       threadsContainer.appendChild(node);
     }
-    if (document.getElementById('main-wrapper').classList.contains('edit')) {
+    if (this.inEditMode) {
       this.checkInputs();
     }
   },
+
   // Adds a new grouping header if necessary (today, tomorrow, ...)
   createThreadContainer: function thlui_createThreadContainer(timestamp) {
-    var threadContainer = document.createDocumentFragment();
+    var threadContainer = document.createElement('div');
     // Create Header DOM Element
     var headerDOM = document.createElement('header');
+
+    // The id is used by the sticky header code as the -moz-element target.
+    headerDOM.id = 'header_' + timestamp;
+
     // Append 'time-update' state
-    headerDOM.dataset.timeUpdate = true;
+    headerDOM.dataset.timeUpdate = 'repeat';
     headerDOM.dataset.time = timestamp;
     headerDOM.dataset.isThread = true;
 
@@ -435,6 +695,7 @@ var ThreadListUI = {
     threadContainer.appendChild(threadsContainerDOM);
     return threadContainer;
   },
+
   // Method for updating all contact info after creating a contact
   updateContactsInfo: function mm_updateContactsInfo() {
     // Prevents cases where updateContactsInfo method is called
@@ -461,11 +722,32 @@ var ThreadListUI = {
       li.classList.remove(remove);
       li.classList.add(current);
     }
+  },
+
+  onDraftSaved: function thlui_onDraftSaved() {
+    this.draftSavedBanner.classList.remove('hide');
+
+    clearTimeout(this.timeouts.onDraftSaved);
+    this.timeouts.onDraftSaved = null;
+
+    this.timeouts.onDraftSaved = setTimeout(function hideDraftSavedBanner() {
+      this.draftSavedBanner.classList.add('hide');
+    }.bind(this), this.DRAFT_SAVED_DURATION);
   }
 };
+
+Object.defineProperty(ThreadListUI, 'allInputs', {
+  get: function() {
+    return this.getAllInputs();
+  }
+});
 
 Object.defineProperty(ThreadListUI, 'selectedInputs', {
   get: function() {
     return this.getSelectedInputs();
   }
 });
+
+exports.ThreadListUI = ThreadListUI;
+
+}(this));

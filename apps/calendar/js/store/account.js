@@ -1,4 +1,5 @@
 (function(window) {
+  'use strict';
 
   function Account() {
     Calendar.Store.Abstract.apply(this, arguments);
@@ -242,8 +243,9 @@
         trans = null;
       }
 
-      if (!account._id)
+      if (!account._id) {
         throw new Error('given account must be persisted');
+      }
 
       if (!account.error) {
         account.error = {
@@ -285,6 +287,34 @@
         account._id,
         fetchedCalendars
       );
+    },
+
+    /**
+     * Finds and returns all accounts that can sync (based on their provider).
+     *
+     *    accountStore.syncableAccounts(function(err, list) {
+     *      if (list.length === 0)
+     *        // hide sync options
+     *    });
+     *
+     * @param {Function} callback [Error err, Array accountList].
+     */
+    syncableAccounts: function(callback) {
+      this.all(function(err, list) {
+        if (err) {
+          return callback(err);
+        }
+
+        var results = [];
+        for (var key in list) {
+          var account = list[key];
+          var provider = Calendar.App.provider(account.providerType);
+          if (provider.canSync) {
+            results.push(account);
+          }
+        }
+        callback(null, results);
+      });
     },
 
     /**

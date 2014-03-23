@@ -1,4 +1,6 @@
 (function(window) {
+  'use strict';
+
   var CALENDAR_PREFIX = 'calendar-';
 
   var template = Calendar.Templates.Calendar;
@@ -50,25 +52,6 @@
       return this._findElement('timeViews');
     },
 
-    handleEvent: function(event) {
-      switch (event.type) {
-        // calendar updated
-        case 'update':
-          this._update.apply(this, event.data);
-          break;
-
-        // calendar added
-        case 'add':
-          this._add.apply(this, event.data);
-          break;
-
-        // calendar removed
-        case 'remove':
-          this._remove.apply(this, event.data);
-          break;
-      }
-    },
-
     _observeUI: function() {
       this.syncButton.addEventListener('click', this._onSyncClick.bind(this));
 
@@ -77,13 +60,28 @@
       );
     },
 
-    _observeStore: function() {
+    _observeAccountStore: function() {
+      var store = this.app.store('Account');
+      var handler = this._updateSyncButton.bind(this);
+
+      store.on('add', handler);
+      store.on('remove', handler);
+    },
+
+    _observeCalendarStore: function() {
       var store = this.app.store('Calendar');
+      var self = this;
+
+      function handle(method) {
+        return function() {
+          self[method].apply(self, arguments);
+        };
+      }
 
       // calendar store events
-      store.on('update', this);
-      store.on('add', this);
-      store.on('remove', this);
+      store.on('update', handle('_update'));
+      store.on('add', handle('_add'));
+      store.on('remove', handle('_remove'));
     },
 
     _persistCalendarDisplay: function(id, displayed) {
@@ -119,9 +117,7 @@
 
     _onCalendarDisplayToggle: function(e) {
       var input = e.target;
-      var self = this;
       var id = input.value;
-      var timeoutId = this._updateTimeouts[id];
 
       if (this._updateTimeouts[id]) {
         clearTimeout(this._updateTimeouts[id]);
@@ -201,13 +197,40 @@
         }
 
         // observe new calendar events
-        this._observeStore();
+        this._observeCalendarStore();
 
-        if (this.onrender) {
-          this.onrender();
+        // observe accounts to hide sync button
+        this._observeAccountStore();
+
+        // show/hide sync button
+        this._updateSyncButton(function() {
+          if (this.onrender) {
+            this.onrender();
+          }
+        }.bind(this));
+      }.bind(this));
+    },
+
+    _updateSyncButton: function(callback) {
+      var store = this.app.store('Account');
+      var element = this.syncButton;
+      var self = this;
+
+      store.syncableAccounts(function(err, list) {
+        if (err) {
+          return callback(err);
         }
 
-      }.bind(this));
+        if (list.length === 0) {
+          element.classList.remove(Calendar.ACTIVE);
+        } else {
+          element.classList.add(Calendar.ACTIVE);
+        }
+
+        // test only event
+        self.onupdatesyncbutton && self.onupdatesyncbutton();
+        typeof callback === 'function' ? callback() : '';
+      });
     },
 
     /**
@@ -235,3 +258,4 @@
   Calendar.ns('Views').Settings = Settings;
 
 }(this));
+

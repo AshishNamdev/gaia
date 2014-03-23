@@ -33,6 +33,12 @@ var TrustedUIManager = {
 
   closeButton: document.getElementById('trustedui-close'),
 
+  errorTitle: document.getElementById('trustedui-error-title'),
+
+  errorMessage: document.getElementById('trustedui-error-message'),
+
+  errorClose: document.getElementById('trustedui-error-close'),
+
   hasTrustedUI: function trui_hasTrustedUI(origin) {
     return (this._dialogStacks[origin] && this._dialogStacks[origin].length);
   },
@@ -50,12 +56,12 @@ var TrustedUIManager = {
     window.addEventListener('appwillopen', this);
     window.addEventListener('appopen', this);
     window.addEventListener('appwillclose', this);
+    window.addEventListener('appcreated', this);
     window.addEventListener('appterminated', this);
     window.addEventListener('keyboardhide', this);
     window.addEventListener('keyboardchange', this);
-    window.addEventListener('mozbrowserloadstart', this);
-    window.addEventListener('mozbrowserloadend', this);
     this.closeButton.addEventListener('click', this);
+    this.errorClose.addEventListener('click', this);
   },
 
   open: function trui_open(name, frame, chromeEventId, onCancelCB) {
@@ -140,12 +146,12 @@ var TrustedUIManager = {
   },
 
   _hideCallerApp: function trui_hideCallerApp(origin, callback) {
-    var app = WindowManager.getRunningApps()[origin];
+    var app = AppWindowManager.getApp(origin);
     if (app == null || app.isHomescreen) {
       return;
     }
 
-    WindowManager.toggleHomescreen(true);
+    this.publish('trusteduishow', { origin: origin });
     var frame = app.frame;
     frame.classList.add('back');
     frame.classList.remove('restored');
@@ -158,14 +164,24 @@ var TrustedUIManager = {
     }
   },
 
+  publish: function trui_publish(evtName, detail) {
+    var evt = new CustomEvent(evtName, {
+      bubbles: true,
+      cancelable: true,
+      detail: detail
+    });
+
+    window.dispatchEvent(evt);
+  },
+
   _restoreCallerApp: function trui_restoreCallerApp(origin) {
-    var frame = WindowManager.getAppFrame(origin);
+    var frame = AppWindowManager.getRunningApps()[origin].frame;
     frame.style.visibility = 'visible';
     frame.classList.remove('back');
-    if (!WindowManager.getCurrentDisplayedApp().isHomescreen) {
-      WindowManager.toggleHomescreen(false);
+    if (!AppWindowManager.getActiveApp().isHomescreen) {
+      this.publish('trusteduihide', { origin: origin });
     }
-    if (WindowManager.getDisplayedApp() == origin) {
+    if (AppWindowManager.getDisplayedApp() == origin) {
       frame.classList.add('restored');
       frame.addEventListener('transitionend', function removeRestored() {
         frame.removeEventListener('transitionend', removeRestored);
@@ -175,14 +191,14 @@ var TrustedUIManager = {
   },
 
   _dispatchCloseEvent: function dispatchCloseEvent(eventId) {
-    var _ = navigator.mozL10n.get;
-    if (!eventId)
+    if (!eventId) {
       return;
+    }
     var event = document.createEvent('customEvent');
     var details = {
       id: eventId,
       type: 'cancel',
-      errorMsg: _('dialog-closed')
+      errorMsg: 'DIALOG_CLOSED_BY_USER'
     };
     event.initCustomEvent('mozContentEvent', true, true, details);
     window.dispatchEvent(event);
@@ -200,13 +216,24 @@ var TrustedUIManager = {
 
   _pushNewDialog: function trui_PushNewDialog(name, frame, chromeEventId,
                                               onCancelCB) {
-    // add some data attributes to the frame
+    // Add some data attributes to the frame.
     var dataset = frame.dataset;
     dataset.frameType = 'popup';
     dataset.frameName = frame.name;
     dataset.frameOrigin = this._lastDisplayedApp;
 
-    // make a shiny new dialog object
+    // Add mozbrowser listeners.
+    this.mozBrowserEventHandler = this.handleBrowserEvent.bind(this);
+    frame.addEventListener('mozbrowsererror',
+                           this.mozBrowserEventHandler);
+    frame.addEventListener('mozbrowserclose',
+                           this.mozBrowserEventHandler);
+    frame.addEventListener('mozbrowserloadstart',
+                           this.mozBrowserEventHandler);
+    frame.addEventListener('mozbrowserloadend',
+                           this.mozBrowserEventHandler);
+
+    // make a shiny new dialog object.
     var dialog = {
       name: name,
       frame: frame,
@@ -214,7 +241,7 @@ var TrustedUIManager = {
       onCancelCB: onCancelCB
     };
 
-    // push and show
+    // Push and show.
     this.currentStack.push(dialog);
     this.dialogTitle.textContent = dialog.name;
     this.container.appendChild(dialog.frame);
@@ -239,24 +266,32 @@ var TrustedUIManager = {
   },
 
   _restoreOrientation: function trui_restoreOrientation() {
-    var app = WindowManager.getDisplayedApp();
-    WindowManager.setOrientationForApp(app);
+    window.dispatchEvent(new Event('trusteduiclose'));
   },
 
   /**
-   * close the dialog identified by the chromeEventId
+   * Close the dialog identified by the chromeEventId.
    */
   _closeDialog: function trui_closeDialog(chromeEventId, origin) {
     var stack = origin ? this._dialogStacks[origin] :
                          this.currentStack;
-    if (stack.length === 0)
+    if (stack.length === 0) {
       return;
+    }
 
     var found = false;
     for (var i = 0; i < stack.length; i++) {
       if (stack[i].chromeEventId === chromeEventId) {
-        var dialog = stack.splice(i, 1)[0];
-        this.container.removeChild(dialog.frame);
+        var frame = stack.splice(i, 1)[0].frame;
+        frame.removeEventListener('mozbrowserloadstart',
+                                  this.mozBrowserEventHandler);
+        frame.removeEventListener('mozbrowserloadend',
+                                  this.mozBrowserEventHandler);
+        frame.removeEventListener('mozbrowsererror',
+                                  this.mozBrowserEventHandler);
+        frame.removeEventListener('mozbrowserclose',
+                                  this.mozBrowserEventHandler);
+        this.container.removeChild(frame);
         found = true;
         break;
       }
@@ -315,31 +350,60 @@ var TrustedUIManager = {
     }
   },
 
+  _showError: function trui_showError(errorProperty) {
+    var dialog = this._getTopDialog();
+    var frame = dialog.frame;
+    if (!('error' in frame.dataset)) {
+      this.container.classList.remove('error');
+      return;
+    }
+
+    var name = dialog.name;
+    var _ = navigator.mozL10n.get;
+
+    this.errorTitle.textContent = _('error-title', {name: name});
+    this.errorMessage.textContent = _(errorProperty, {name: name});
+
+    this.container.classList.add('error');
+  },
+
   handleEvent: function trui_handleEvent(evt) {
     switch (evt.type) {
       case 'home':
       case 'holdhome':
-        if (!this.isVisible())
+        if (!this.isVisible()) {
           return;
-
+        }
         this._hideTrustedApp();
         break;
       case 'click':
-        // Close-button clicked
+        // cancel button or error close button
+        this.container.classList.remove('error');
         this._destroyDialog();
         break;
       case 'appterminated':
         this._destroyDialog(evt.detail.origin);
         break;
+      case 'appcreated':
+        // XXX: This is a quick fix for sometimes an app is created
+        // at background and never got brought to foregroud.
+        // We ought not to repy on app* events but embed us
+        // in appWindow class to achieve a true fix.
+        // See https://bugzilla.mozilla.org/show_bug.cgi?id=911880
+        if (!this._dialogStacks[evt.detail.origin]) {
+          this._dialogStacks[evt.detail.origin] = [];
+        }
+        break;
       case 'appwillopen':
+        var app = evt.detail;
         // Hiding trustedUI when coming from Activity
         if (this.isVisible())
           this._hideTrustedApp();
 
         // Ignore homescreen
-        if (evt.target.classList.contains('homescreen'))
+        if (app.isHomescreen)
           return;
-        this._lastDisplayedApp = evt.detail.origin;
+        this._lastDisplayedApp = app.origin;
         if (this.currentStack.length) {
           // Reopening an app with trustedUI
           this.popupContainer.classList.remove('up');
@@ -367,15 +431,28 @@ var TrustedUIManager = {
       case 'keyboardhide':
         this._setHeight(window.innerHeight - StatusBar.height);
         break;
+    }
+  },
+
+  handleBrowserEvent: function trui_handleBrowserEvent(evt) {
+    switch (evt.type) {
       case 'mozbrowserloadstart':
-        this.throbber.classList.add('loading');
+        TrustedUIManager.throbber.classList.add('loading');
         break;
       case 'mozbrowserloadend':
-        this.throbber.classList.remove('loading');
+        TrustedUIManager.throbber.classList.remove('loading');
+        break;
+      case 'mozbrowsererror':
+        this._getTopDialog().frame.dataset.error = true;
+        this._showError('crash-banner-app');
+        break;
+      case 'mozbrowserclose':
+        // window.close
+        this.container.classList.remove('error');
+        this._destroyDialog();
         break;
     }
   }
-
 };
 
 TrustedUIManager.init();

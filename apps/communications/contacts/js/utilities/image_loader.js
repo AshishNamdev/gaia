@@ -1,12 +1,11 @@
+/* exported  ImageLoader */
 'use strict';
 
 if (!window.ImageLoader) {
   var ImageLoader = function ImageLoader(pContainer, pItems) {
-    var container, items, itemsSelector, scrollLatency = 100, scrollTimer,
-        lastViewTop = 0, itemHeight, total, imgsLoading = 0,
+    var container, items, itemsSelector, lastScrollTime, scrollLatency = 100,
+        scrollTimer, itemHeight, total, imgsLoading = 0,
         loadImage = defaultLoadImage, self = this;
-
-    var forEach = Array.prototype.forEach;
 
     init(pContainer, pItems);
 
@@ -19,16 +18,19 @@ if (!window.ImageLoader) {
       container = document.querySelector(pContainer);
 
       container.addEventListener('scroll', onScroll);
-      document.addEventListener('onupdate', function(evt) {
-        evt.stopPropagation();
-        onScroll();
-      });
+      document.addEventListener('onupdate', onUpdate);
 
       load();
     }
 
+    function onUpdate(evt) {
+      evt.stopPropagation();
+      onScroll();
+    }
+
     function load() {
       window.clearTimeout(scrollTimer);
+      scrollTimer = null;
       items = container.querySelectorAll(itemsSelector);
       // All items have the same height
       itemHeight = items[0] ? items[0].offsetHeight : 1;
@@ -37,25 +39,50 @@ if (!window.ImageLoader) {
       window.setTimeout(update, 0);
     }
 
+    function unload() {
+      container.removeEventListener('scroll', onScroll);
+      document.removeEventListener('onupdate', onUpdate);
+      window.clearTimeout(scrollTimer);
+      scrollTimer = null;
+    }
+
     function setResolver(pResolver) {
       loadImage = pResolver;
     }
 
     function onScroll() {
-      window.clearTimeout(scrollTimer);
       if (imgsLoading > 0) {
         // Stop the pending images load
         window.stop();
         imgsLoading = 0;
       }
-      scrollTimer = window.setTimeout(update, scrollLatency);
+      // Clearing and setting a timer on every scroll event is too slow on
+      // some mobile devices. Therefore, set a timer once here and then
+      // check how long it has been since the last scroll event in the
+      // timer handler to determine what to do.
+      lastScrollTime = Date.now();
+      if (!scrollTimer) {
+        scrollTimer = window.setTimeout(updateFromScroll, scrollLatency);
+      }
+    }
+
+    function updateFromScroll() {
+      scrollTimer = null;
+      // If we scrolled more since the timer was set, then we need to
+      // delay again.  Otherwise, go ahead and update now.
+      var deltaLatency = lastScrollTime - Date.now() + scrollLatency;
+      if (deltaLatency > 0) {
+        scrollTimer = window.setTimeout(updateFromScroll, deltaLatency);
+      } else {
+        update();
+      }
     }
 
     /**
      *  Loads the image contained in a DOM Element.
      */
     function defaultLoadImage(item) {
-      var image = item.querySelector('img[data-src]');
+      var image = item.querySelector('span[data-type=img][data-src]');
       if (!image) {
         return;
       }
@@ -65,7 +92,7 @@ if (!window.ImageLoader) {
       var src = tmp.src = image.dataset.src;
       tmp.onload = function onload() {
         --imgsLoading;
-        image.src = src;
+        image.style.backgroundImage = 'url(' + src + ')';
         if (tmp.complete) {
           item.dataset.visited = 'true';
         }
@@ -73,6 +100,7 @@ if (!window.ImageLoader) {
       };
 
       tmp.onabort = tmp.onerror = function onerror() {
+        --imgsLoading;
         item.dataset.visited = 'false';
         tmp = null;
       };
@@ -109,24 +137,37 @@ if (!window.ImageLoader) {
 
       // Goes forward
       for (var j = index + 1; j < total; j++) {
-        var item = items[j];
-        if (!item) {
+        var theItem = items[j];
+        if (!theItem) {
           // Returning because of index out of bound
           return;
         }
 
-        if (item.offsetTop > viewTop + containerHeight) {
+        if (theItem.offsetTop > viewTop + containerHeight) {
           return; // Below
         }
 
-        if (item.dataset.visited !== 'true') {
-          loadImage(item, self);
+        if (theItem.dataset.visited !== 'true') {
+          loadImage(theItem, self);
         }
       }
     } // update
 
+    function releaseImage(item) {
+      var image = item.querySelector('span[data-type=img][data-src]');
+      if (!image) {
+        return null;
+      }
+      image.style.backgroundImage = 'none';
+      item.dataset.visited = 'false';
+      return image;
+    }
+
     this.reload = load;
+    this.unload = unload;
     this.setResolver = setResolver;
     this.defaultLoad = defaultLoadImage;
+    this.releaseImage = releaseImage;
   };
+
 }

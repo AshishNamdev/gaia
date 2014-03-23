@@ -41,8 +41,11 @@ var AttentionScreen = {
     window.addEventListener('home', this.hide.bind(this));
     window.addEventListener('holdhome', this.hide.bind(this));
     window.addEventListener('appwillopen', this.appOpenHandler.bind(this));
+    window.addEventListener('launchapp', this.appLaunchHandler.bind(this));
+    window.addEventListener('emergencyalert', this.hide.bind(this));
 
-    window.addEventListener('will-unlock', this.screenUnlocked.bind(this));
+    window.addEventListener('appforeground',
+      this.appForegroundHandler.bind(this));
   },
 
   resize: function as_resize(evt) {
@@ -61,10 +64,25 @@ var AttentionScreen = {
     }
   },
 
+  toggle: function as_toggle(evt) {
+    if (evt.detail.height <= 40) {
+      evt.target.dataset.appRequestedSmallSize = '';
+      this.hide();
+    } else {
+      this.show();
+    }
+  },
+
   appOpenHandler: function as_appHandler(evt) {
     // If the user presses the home button we will still hide the attention
     // screen. But in the case of an app crash we'll keep it fully open
     if (!evt.detail.isHomescreen) {
+      this.hide();
+    }
+  },
+
+  appLaunchHandler: function as_appLaunchHandler(evt) {
+    if (!evt.detail.stayBackground) {
       this.hide();
     }
   },
@@ -90,7 +108,6 @@ var AttentionScreen = {
       return;
 
     // Hide sleep menu/list menu if it is shown now
-    ListMenu.hide();
     SleepMenu.hide();
 
     // We want the user attention, so we need to turn the screen on
@@ -103,11 +120,19 @@ var AttentionScreen = {
     attentionFrame.dataset.frameType = 'attention';
     attentionFrame.dataset.frameName = evt.detail.name;
     attentionFrame.dataset.frameOrigin = evt.target.dataset.frameOrigin;
+    attentionFrame.dataset.manifestURL = manifestURL;
+    attentionFrame.addEventListener('mozbrowserresize', this.toggle.bind(this));
 
     // We would like to put the dialer call screen on top of all other
     // attention screens by ensure it is the last iframe in the DOM tree
     if (this._hasTelephonyPermission(app)) {
       this.attentionScreen.appendChild(attentionFrame);
+
+      // This event is for SIM PIN lock module.
+      // Because we don't need SIM PIN dialog during call
+      // but the IccHelper cardstatechange event could
+      // be invoked by airplane mode toggle before the call is established.
+      this.dispatchEvent('callscreenwillopen');
     } else {
       this.attentionScreen.insertBefore(attentionFrame,
                                         this.bar.nextElementSibling);
@@ -119,8 +144,7 @@ var AttentionScreen = {
     // alternatively, if the newly appended frame is the visible frame
     // and we are in the status bar mode, expend to full screen mode.
     if (!this.isVisible()) {
-      // Attention screen now only support portrait mode.
-      screen.mozLockOrientation('portrait-primary');
+      this.tryLockOrientation();
 
       this.attentionScreen.classList.add('displayed');
       this.mainScreen.classList.add('attention');
@@ -167,6 +191,16 @@ var AttentionScreen = {
         (evt.type === 'mozbrowsererror' && evt.detail.type !== 'fatal'))
       return;
 
+    // Check telephony permission before removing.
+    var app = Applications.getByManifestURL(evt.target.dataset.manifestURL);
+    if (app && this._hasTelephonyPermission(app)) {
+      // This event is for SIM PIN lock module.
+      // Because we don't need SIM PIN dialog during call
+      // but the IccHelper cardstatechange event could
+      // be invoked by airplane mode toggle before the call is established.
+      this.dispatchEvent('callscreenwillclose');
+    }
+
     // Remove the frame
     var origin = evt.target.dataset.frameOrigin;
     this.attentionScreen.removeChild(evt.target);
@@ -200,11 +234,6 @@ var AttentionScreen = {
         { origin: this.attentionScreen.lastElementChild.dataset.frameOrigin });
     }
 
-    // Restore the orientation of current displayed app
-    var currentApp = WindowManager.getDisplayedApp();
-    if (currentApp)
-      WindowManager.setOrientationForApp(currentApp);
-
     this.attentionScreen.classList.remove('displayed');
     this.mainScreen.classList.remove('attention');
     this.dispatchEvent('attentionscreenhide', { origin: origin });
@@ -212,8 +241,10 @@ var AttentionScreen = {
 
   // expend the attention screen overlay to full screen
   show: function as_show() {
-    // Attention screen now only support portrait mode.
-    screen.mozLockOrientation('portrait-primary');
+    // Attention screen now only support default orientation.
+    this.tryLockOrientation();
+
+    delete this.attentionScreen.lastElementChild.dataset.appRequestedSmallSize;
 
     // leaving "status-mode".
     this.attentionScreen.classList.remove('status-mode');
@@ -239,12 +270,6 @@ var AttentionScreen = {
     if (!this.isFullyVisible())
       return;
 
-    // Restore the orientation of current displayed app
-    var currentApp = WindowManager.getDisplayedApp();
-
-    if (currentApp)
-      WindowManager.setOrientationForApp(currentApp);
-
     // entering "active-statusbar" mode,
     // with a transform: translateY() slide up transition.
     this.mainScreen.classList.add('active-statusbar');
@@ -264,6 +289,22 @@ var AttentionScreen = {
     });
   },
 
+  // If the lock request fails, request again later.
+  // XXX: Group orientation requests in orientation manager to avoid this.
+  tryLockOrientation: function as_tryLockOrientation() {
+    var tries = 20;
+    var tryToUnlock = function() {
+      var rv = screen.mozLockOrientation(OrientationManager.defaultOrientation);
+      if (!rv && tries--) {
+        console.warn(
+          'Attention screen fails on locking orientation, retrying..');
+        setTimeout(tryToUnlock, 20);
+      }
+    };
+
+    tryToUnlock();
+  },
+
   dispatchEvent: function as_dispatchEvent(name, detail) {
     var evt = document.createEvent('CustomEvent');
     evt.initCustomEvent(name, true, true, detail);
@@ -280,16 +321,22 @@ var AttentionScreen = {
       return;
 
     var attentionFrame = this.attentionScreen.lastElementChild;
+    // We don't want to reopen the attention screen when the app requested a
+    // statusbar attention screen
+    if (attentionFrame.dataset.hasOwnProperty('appRequestedSmallSize')) {
+      return;
+    }
+
     var frameOrigin = attentionFrame.dataset.frameOrigin;
     if (origin === frameOrigin) {
       this.show();
     }
   },
 
-  screenUnlocked: function as_screenUnlocked() {
+  appForegroundHandler: function as_appForegroundHandler(evt) {
     // If the app behind the soon-to-be-unlocked lockscreen has an
     // attention screen we should display it
-    var app = WindowManager.getCurrentDisplayedApp();
+    var app = evt.detail;
     this.showForOrigin(app.origin);
   },
 

@@ -1,36 +1,82 @@
-requireApp('communications/dialer/js/mmi.js');
+/* globals MocksHelper, MockMozMobileConnection, MmiManager, MockMmiUI,
+           MmiManager, SUCCESS_MMI_MSG, SUCCESS_MMI_MSG, SUCCESS_MMI_NO_MSG,
+           FAILED_MMI_MSG, FAILED_MMI_MSG, FAILED_MMI_NO_MSG, MMI_MSG */
 
+'use strict';
+
+requireApp('communications/dialer/js/mmi.js');
+requireApp('communications/dialer/test/unit/mock_l10n.js');
 requireApp('communications/dialer/test/unit/mock_mmi_ui.js');
 requireApp('communications/dialer/test/unit/mock_mozMobileConnection.js');
-requireApp('communications/dialer/test/unit/mock_l10n.js');
+requireApp('communications/dialer/test/unit/mock_lazy_loader.js');
+
+require('/shared/test/unit/mocks/mock_mobile_operator.js');
 
 const TINY_TIMEOUT = 5;
 
-if (!this.LazyL10n) {
-  this.LazyL10n = null;
-}
+var mocksHelperForMMI = new MocksHelper([
+  'LazyL10n',
+  'LazyLoader',
+  'MobileOperator'
+]).init();
 
 suite('dialer/mmi', function() {
-  var keys = {};
-  var realLazyL10n;
+  var realMobileConnection;
 
-  suiteSetup(function() {
-    MmiManager._conn = MockMozMobileConnection;
+  mocksHelperForMMI.attachTestHelpers();
+
+  setup(function() {
+    realMobileConnection = window.navigator.mozMobileConnection;
+    window.navigator.mozMobileConnection = MockMozMobileConnection;
+
     MmiManager._ui = MockMmiUI;
     window.addEventListener('message',
                             MmiManager._ui.postMessage.bind(MmiManager._ui));
-    realLazyL10n = window.LazyL10n;
-    window.LazyL10n = MockLazyL10n;
     MmiManager.ready = true;
   });
 
-  suiteTeardown(function() {
-    window.LazyL10n = realLazyL10n;
+  teardown(function() {
+    delete MockMozMobileConnection.voice.type;
+    delete MockMozMobileConnection.supportedNetworkTypes;
+
+    window.navigator.mozMobileConnection = realMobileConnection;
+
+    MmiManager._conn.mTeardown();
+    MmiManager._ui.teardown();
   });
 
-  teardown(function() {
-    MmiManager._conn.teardown();
-    MmiManager._ui.teardown();
+  suite('Validate MMI codes', function() {
+    setup(function(done) {
+      MmiManager.init(done);
+    });
+
+    test('Check an MMI code', function() {
+      assert.isTrue(MmiManager.isMMI('*123#'));
+    });
+
+    test('Check a non-MMI code', function() {
+      assert.isFalse(MmiManager.isMMI('123'));
+    });
+
+    test('In CDMA networks MMI codes are never allowed', function() {
+      var cdmaTypes = ['evdo0', 'evdoa', 'evdob', '1xrtt', 'is95a', 'is95b'];
+
+      for (var i = 0; i < cdmaTypes.length; i++) {
+        MockMozMobileConnection.voice.type = cdmaTypes[i];
+        assert.isFalse(MmiManager.isMMI('*123#'));
+      }
+    });
+
+    test('Requesting the IMEI is allowed on phones supporting GSM networks',
+      function() {
+        MockMozMobileConnection.supportedNetworkTypes = ['gsm', 'lte', 'wcdma'];
+        MockMozMobileConnection.voice.type = 'is95a';
+        assert.isTrue(MmiManager.isMMI('*#06#'));
+
+        MockMozMobileConnection.supportedNetworkTypes = ['cdma', 'evdo'];
+        MockMozMobileConnection.voice.type = 'evdoa';
+        assert.isFalse(MmiManager.isMMI('*#06#'));
+      });
   });
 
   suite('Successfully send mmi message with result', function() {
@@ -60,7 +106,7 @@ suite('dialer/mmi', function() {
 
     test('Check empty request result', function(done) {
       setTimeout(function() {
-        assert.isNull(MmiManager._ui._messageReceived);
+        assert.isUndefined(MmiManager._ui._messageReceived);
         done();
       }, TINY_TIMEOUT);
     });
@@ -100,7 +146,7 @@ suite('dialer/mmi', function() {
 
     test('Check empty request result', function(done) {
       setTimeout(function() {
-        assert.isNull(MmiManager._ui._messageReceived);
+        assert.equal(MmiManager._ui._messageReceived, 'GenericFailure');
         done();
       }, TINY_TIMEOUT);
     });
@@ -209,6 +255,9 @@ suite('dialer/mmi', function() {
       }, TINY_TIMEOUT);
     });
   });
+
+  /** Temporary disable CF tests until Bug 884343 (Use MMIResult for Call
+   *   Forwarding related functionality) is done.
 
   suite('Call forwarding request via MMI. Active voice', function() {
     test('Check call forwarding rules', function(done) {
@@ -355,4 +404,6 @@ suite('dialer/mmi', function() {
       assert.equal(MmiManager._ui._messageReceived, null);
     });
   });
+
+  */
 });

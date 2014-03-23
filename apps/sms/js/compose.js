@@ -1,6 +1,10 @@
 /* -*- Mode: js; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- /
 /* vim: set shiftwidth=2 tabstop=2 autoindent cindent expandtab: */
 
+/*global Settings, Utils, Attachment, AttachmentMenu, MozActivity, SMIL,
+        ThreadUI */
+/*exported Compose */
+
 'use strict';
 
 /**
@@ -10,6 +14,7 @@
  */
 var Compose = (function() {
   var placeholderClass = 'placeholder';
+  var attachmentClass = 'attachment-container';
 
   var slice = Array.prototype.slice;
   var attachments = new WeakMap();
@@ -18,6 +23,7 @@ var Compose = (function() {
   var dom = {
     form: null,
     message: null,
+    subject: null,
     sendButton: null,
     attachButton: null
   };
@@ -31,48 +37,107 @@ var Compose = (function() {
     empty: true,
     maxLength: null,
     size: null,
+    lastScrollPosition: 0,
+    resizing: false,
+
     // 'sms' or 'mms'
     type: 'sms'
   };
 
-  // handler for 'input' in contentEditable
-  function composeCheck(e) {
+  var subject = {
+    isVisible: false,
+    toggle: function sub_toggle() {
+      this.isVisible ? this.hide() : this.show();
+    },
+    show: function sub_show() {
+      dom.subject.classList.remove('hide');
+      this.isVisible = true;
+      dom.subject.focus();
+      Compose.updateType();
+      onContentChanged();
+    },
+    hide: function sub_hide() {
+      dom.subject.classList.add('hide');
+      this.isVisible = false;
+      dom.message.focus();
+      Compose.updateType();
+      onContentChanged();
+    },
+    clear: function sub_clear() {
+      dom.subject.value = '';
+      dom.subject.classList.add('hide');
+      this.isVisible = false;
+    },
+    getContent: function sub_getContent() {
+      // Only send value if subject is showing. If not, send empty string
+      // We need to transform any linebreak or into a single space
+      return subject.isShowing ?
+             dom.subject.value.replace(/\n\s*/g, ' ') : '';
+    },
+    setContent: function sub_setContent(content) {
+      dom.subject.value = content;
+    },
+    getMaxLength: function sub_getMaxLength() {
+      return dom.subject.maxLength;
+    },
+    get isEmpty() {
+      return !dom.subject.value.length;
+    },
+    get isShowing() {
+      return this.isVisible;
+    }
+  };
 
-    var textLength = dom.message.textContent.length;
-    var empty = !textLength;
-    var hasFrames = !!dom.message.querySelector('iframe');
+  // anytime content changes - takes a parameter to check for image resizing
+  function onContentChanged(duck) {
+    // Track when content is edited for draft replacement case
+    if (ThreadUI.draft) {
+      ThreadUI.draft.isEdited = true;
+    }
 
-    if (empty) {
+    // if the duck is an image attachment, handle resizes
+    if (duck instanceof Attachment && duck.type === 'img') {
+      return imageAttachmentsHandling();
+    }
+
+    var messageHasFrames = !!dom.message.querySelector('iframe');
+    var isEmptyMessage = !dom.message.textContent.length && !messageHasFrames;
+    var isEmptySubject = subject.isEmpty;
+
+    if (isEmptyMessage) {
       var brs = dom.message.getElementsByTagName('br');
       // firefox will keep an extra <br> in there
-      if (brs.length > 1 || hasFrames) {
-        empty = false;
+      if (brs.length > 1) {
+        isEmptyMessage = false;
       }
     }
 
+    // Placeholder management
     var placeholding = dom.message.classList.contains(placeholderClass);
-    if (placeholding && !empty) {
+    if (placeholding && !isEmptyMessage) {
       dom.message.classList.remove(placeholderClass);
+    }
+    if (!placeholding && isEmptyMessage) {
+      dom.message.classList.add(placeholderClass);
+    }
+
+    // Send button management
+    /* The send button should be enabled only in the situations where:
+     * - The subject is showing and is not empty (it has text)
+     * - The message is not empty (it has text or attachment)
+    */
+    if ((isEmptyMessage && !subject.isShowing) ||
+        (isEmptyMessage && subject.isShowing && isEmptySubject)) {
+      compose.disable(true);
+      state.empty = true;
+    } else {
       compose.disable(false);
       state.empty = false;
     }
-    if (!placeholding && empty) {
-      dom.message.classList.add(placeholderClass);
-      compose.disable(true);
-      state.empty = true;
-    }
 
-    trigger('input', e);
+    compose.updateType();
 
-    if (hasFrames && state.type == 'sms') {
-      compose.type = 'mms';
-    }
-
-    if (!hasFrames && state.type == 'mms') {
-      // this operation is cancelable
-      compose.type = 'sms';
-    }
-
+    trigger.call(compose, 'input', new CustomEvent('input'));
   }
 
   function composeKeyEvents(e) {
@@ -92,11 +157,10 @@ var Compose = (function() {
 
     if (fns && fns.length) {
       for (var i = 0; i < fns.length; i++) {
-        fns[i].apply(this, args);
+        fns[i].apply(compose, args);
       }
     }
   }
-
 
   function insert(item) {
     var fragment = document.createDocumentFragment();
@@ -108,43 +172,107 @@ var Compose = (function() {
       var node = item.render();
       attachments.set(node, item);
       fragment.appendChild(node);
-    } else if (item.tagName === 'IFRAME') {
+    } else if (item.nodeName === 'IFRAME') {
       // this iframe is generated by us
       fragment.appendChild(item);
     } else if (typeof item === 'string') {
-      var container = document.createElement('div');
-      container.innerHTML = item;
-      [].forEach.call(container.childNodes, function(node) {
-        if (node.tagName === 'BR') {
-          fragment.appendChild(document.createElement('br'));
-        }
-        else if (node.nodeType === Node.TEXT_NODE) {
-          fragment.appendChild(node);
-        }
+      item.split('\n').forEach(function(line) {
+        fragment.appendChild(document.createTextNode(line));
+        fragment.appendChild(document.createElement('br'));
       });
+      fragment.lastElementChild.remove();
     }
 
     return fragment;
+  }
+
+  function imageAttachmentsHandling() {
+    // There is need to resize image attachment if total compose
+    // size doen't exceed mms size limitation.
+    if (Compose.size < Settings.mmsSizeLimitation) {
+      onContentChanged();
+      return;
+    }
+
+    var nodes = dom.message.querySelectorAll('iframe');
+    var imgNodes = [];
+    var done = 0;
+    Array.prototype.forEach.call(nodes, function findImgNodes(node) {
+      var item = attachments.get(node);
+      if (item.type === 'img') {
+        imgNodes.push(node);
+      }
+    });
+
+    // Total number of images < 3
+    //   => Set max image size to 2/5 message size limitation.
+    // Total number of images >= 3
+    //   => Set max image size to 1/5 message size limitation.
+    var images = imgNodes.length;
+    var limit = images > 2 ? Settings.mmsSizeLimitation * 0.2 :
+                             Settings.mmsSizeLimitation * 0.4;
+
+    function imageSized() {
+      if (++done === images) {
+        state.resizing = false;
+        onContentChanged();
+      }
+    }
+
+    state.resizing = true;
+    imgNodes.forEach(function(node) {
+      var item = attachments.get(node);
+      if (item.blob.size < limit) {
+        imageSized();
+      } else {
+        Utils.getResizedImgBlob(item.blob, limit, function(resizedBlob) {
+          // trigger recalc when resized
+          state.size = null;
+
+          item.blob = resizedBlob;
+          var newNode = item.render();
+          attachments.set(newNode, item);
+          if (dom.message.contains(node)) {
+            dom.message.insertBefore(newNode, node);
+            dom.message.removeChild(node);
+          }
+          imageSized();
+        });
+      }
+    });
+    onContentChanged();
   }
 
   var compose = {
     init: function composeInit(formId) {
       dom.form = document.getElementById(formId);
       dom.message = dom.form.querySelector('[contenteditable]');
+      dom.subject = document.getElementById('messages-subject-input');
       dom.sendButton = document.getElementById('messages-send-button');
       dom.attachButton = document.getElementById('messages-attach-button');
+      dom.optionsMenu = document.getElementById('attachment-options-menu');
 
-      // update the placeholder after input
-      dom.message.addEventListener('input', composeCheck);
+      // update the placeholder, send button and Compose.type
+      dom.message.addEventListener('input', onContentChanged);
+      dom.subject.addEventListener('input', onContentChanged);
 
       // we need to bind to keydown & keypress because of #870120
       dom.message.addEventListener('keydown', composeKeyEvents);
       dom.message.addEventListener('keypress', composeKeyEvents);
 
+      dom.message.addEventListener('click',
+        this.onAttachmentClick.bind(this));
+
+      dom.optionsMenu.addEventListener('click',
+        this.onAttachmentMenuClick.bind(this));
+
       dom.attachButton.addEventListener('click',
         this.onAttachClick.bind(this));
 
+      this.clearListeners();
       this.clear();
+
+      this.on('type', this.onTypeChange);
 
       return this;
     },
@@ -155,6 +283,7 @@ var Compose = (function() {
       }
       return this;
     },
+
     off: function(type, handler) {
       if (handlers[type]) {
         var index = handlers[type].indexOf(handler);
@@ -165,22 +294,33 @@ var Compose = (function() {
       return this;
     },
 
+    clearListeners: function() {
+      for (var type in handlers) {
+        handlers[type] = [];
+      }
+    },
+
     getContent: function() {
       var content = [];
-      var lastContent = 0;
       var node;
-      var i;
 
       for (node = dom.message.firstChild; node; node = node.nextSibling) {
         // hunt for an attachment in the WeakMap and append it
         var attachment = attachments.get(node);
         if (attachment) {
-          lastContent = content.push(attachment);
+          content.push(attachment);
           continue;
         }
 
         var last = content.length - 1;
         var text = node.textContent;
+
+        // Bug 877141 - contenteditable wil insert non-break spaces when
+        // multiple consecutive spaces are entered, we don't want them.
+        if (text) {
+          text = text.replace(/\u00A0/g, ' ');
+        }
+
         if (node.nodeName == 'BR') {
           if (node === dom.message.lastChild) {
             continue;
@@ -189,20 +329,95 @@ var Compose = (function() {
         }
 
         // append (if possible) text to the last entry
-        if (text.length && typeof content[last] === 'string') {
-          content[last] += text;
-        } else {
-          // push even if text.length === 0, there could be a <br>
-          content.push(text);
-        }
-
-        // keep track of the last populated line
-        if (text.length > 0) {
-          lastContent = content.length;
+        if (text.length) {
+          if (typeof content[last] === 'string') {
+            content[last] += text;
+          } else {
+            content.push(text);
+          }
         }
       }
 
       return content;
+    },
+
+    getSubject: function() {
+      return subject.getContent();
+    },
+
+    toggleSubject: function() {
+      subject.toggle();
+    },
+    /** Render draft
+     *
+     * @param {Draft} draft Draft to be loaded into the composer.
+     *
+     */
+    fromDraft: function(draft) {
+      // Clear out the composer
+      this.clear();
+
+      // If we don't have a draft, return only having cleared the composer
+      if (!draft) {
+        return;
+      }
+
+      if (draft.subject) {
+        dom.subject.value = draft.subject;
+        subject.toggle();
+      }
+
+      // draft content is an array
+      draft.content.forEach(function(fragment) {
+        // If the fragment is an attachment
+        // use the stored content to instantiate a new Attachment object
+        // to be properly rendered after a cold start for the app
+        if (fragment.blob) {
+          fragment = new Attachment(fragment.blob, {
+            isDraft: true
+          });
+        }
+        // Append each fragment in order to the composer
+        Compose.append(fragment);
+      }, Compose);
+
+      this.focus();
+    },
+
+    /** Render message (sms or mms)
+     *
+     * @param {message} message Full message to be loaded into the composer.
+     *
+     */
+    fromMessage: function(message) {
+      this.clear();
+
+      if (message.type === 'mms') {
+        if (message.subject) {
+          subject.setContent(message.subject);
+          subject.show();
+        }
+        SMIL.parse(message, function(elements) {
+          elements.forEach(function(element) {
+            if (element.blob) {
+              var attachment = new Attachment(element.blob, {
+                name: element.name,
+                isDraft: true
+              });
+              this.append(attachment);
+            }
+            if (element.text) {
+              this.append(element.text);
+            }
+          }, this);
+          this.ignoreEvents = false;
+          this.focus();
+        }.bind(this));
+        this.ignoreEvents = true;
+      } else {
+        this.append(message.body);
+        this.focus();
+      }
     },
 
     getText: function() {
@@ -225,13 +440,46 @@ var Compose = (function() {
       return this;
     },
 
+    scrollToTarget: function(target) {
+      // target can be an element or a selection range
+      var targetRect = target.getBoundingClientRect();
+
+      // put the middle of the target at the middle of the container box
+      var containerRect = dom.message.getBoundingClientRect();
+      var offset = (targetRect.top + targetRect.height / 2) -
+          (containerRect.top + containerRect.height / 2);
+
+      // we += because the scrollTop that was set is already compensated
+      // with the getBoundingClientRect()
+      dom.message.scrollTop += offset;
+    },
+
+    scrollMessageContent: function() {
+      if (document.activeElement === dom.message) {
+        // we just got the focus: ensure the caret is visible
+        var range = window.getSelection().getRangeAt(0);
+        if (range.collapsed) {
+          // We can't get the bounding client rect of a collapsed range,
+          // so let's insert a temporary node to get the caret position.
+          range.insertNode(document.createElement('span'));
+          this.scrollToTarget(range);
+          range.deleteContents();
+        } else {
+          this.scrollToTarget(range);
+        }
+        state.lastScrollPosition = dom.message.scrollTop;
+      } else {
+        // we just lost the focus: restore the last scroll position
+        dom.message.scrollTop = state.lastScrollPosition;
+      }
+    },
+
     /** Writes node to composition element
      * @param {mixed} item Html, DOMNode, or attachment to add
      *                     to composition element.
      * @param {Boolean} position True to append, false to prepend or
      *                           undefined/null for auto (at cursor).
      */
-
     prepend: function(item) {
       var fragment = insert(item);
 
@@ -243,7 +491,7 @@ var Compose = (function() {
         dom.message.insertBefore(fragment, dom.message.childNodes[0]);
       }
 
-      composeCheck();
+      onContentChanged(item);
       return this;
     },
 
@@ -251,30 +499,107 @@ var Compose = (function() {
       var fragment = insert(item);
 
       if (document.activeElement === dom.message) {
+        // insert element at caret position
         var range = window.getSelection().getRangeAt(0);
         var firstNodes = fragment.firstChild;
         range.deleteContents();
         range.insertNode(fragment);
+        this.scrollToTarget(range);
         dom.message.focus();
         range.setStartAfter(firstNodes);
       } else {
+        // insert element at the end of the Compose area
         dom.message.insertBefore(fragment, dom.message.lastChild);
+        this.scrollToTarget(dom.message.lastChild);
       }
-      composeCheck();
+      onContentChanged(item);
       return this;
     },
 
     clear: function() {
       dom.message.innerHTML = '<br>';
-      state.full = false;
+      subject.clear();
+      state.resizing = state.full = false;
       state.size = 0;
-      composeCheck();
+      state.empty = true;
+      onContentChanged();
       return this;
     },
 
-    onAttachClick: function thui_onAttachClick() {
+    focus: function() {
+      dom.message.focus();
+      return this;
+    },
+
+    updateType: function() {
+      if ((subject.isShowing && !subject.isEmpty) ||
+          !!dom.message.querySelector('iframe')) {
+        this.type = 'mms';
+      } else {
+        this.type = 'sms';
+      }
+    },
+
+    onAttachClick: function thui_onAttachClick(event) {
       var request = this.requestAttachment();
       request.onsuccess = this.append.bind(this);
+      request.onerror = function(err) {
+        if (err === 'file too large') {
+          alert(navigator.mozL10n.get('file-too-large'));
+        }
+      };
+    },
+
+    onAttachmentClick: function thui_onAttachmentClick(event) {
+      if (event.target.classList.contains(attachmentClass) && !state.resizing) {
+        this.currentAttachmentDOM = event.target;
+        this.currentAttachment = attachments.get(event.target);
+        AttachmentMenu.open(this.currentAttachment);
+      }
+    },
+
+    onAttachmentMenuClick: function thui_onAttachmentMenuClick(event) {
+      event.preventDefault();
+      switch (event.target.id) {
+        case 'attachment-options-view':
+          this.currentAttachment.view();
+          break;
+        case 'attachment-options-remove':
+          attachments.delete(this.currentAttachmentDOM);
+          dom.message.removeChild(this.currentAttachmentDOM);
+          state.size = null;
+          onContentChanged();
+          AttachmentMenu.close();
+          break;
+        case 'attachment-options-replace':
+          var request = this.requestAttachment();
+          request.onsuccess = (function replaceAttachmentWith(newAttachment) {
+            var fragment = insert(newAttachment);
+
+            dom.message.insertBefore(fragment, this.currentAttachmentDOM);
+            dom.message.removeChild(this.currentAttachmentDOM);
+
+            onContentChanged(newAttachment);
+            AttachmentMenu.close();
+          }).bind(this);
+          request.onerror = function(err) {
+            if (err === 'file too large') {
+              alert(navigator.mozL10n.get('file-too-large'));
+            }
+          };
+          break;
+        case 'attachment-options-cancel':
+          AttachmentMenu.close();
+          break;
+      }
+    },
+
+    onTypeChange: function c_onTypeChange() {
+      if (this.type === 'sms') {
+        dom.message.setAttribute('x-inputmode', '-moz-sms');
+      } else {
+        dom.message.removeAttribute('x-inputmode');
+      }
     },
 
     /** Initiates a 'pick' MozActivity allowing the user to create an
@@ -287,26 +612,44 @@ var Compose = (function() {
     requestAttachment: function() {
       // Mimick the DOMRequest API
       var requestProxy = {};
-      var activity = new MozActivity({
+      var activityData = {
+        type: ['image/*', 'audio/*', 'video/*']
+      };
+      var activity;
+
+      if (Settings.mmsSizeLimitation) {
+        activityData.maxFileSizeBytes = Settings.mmsSizeLimitation;
+      }
+
+      activity = new MozActivity({
         name: 'pick',
-        data: {
-          // TODO: Extend this array with elements 'audio/*' and 'video/*'
-          type: ['image/*']
-        }
+        data: activityData
       });
 
       activity.onsuccess = function() {
         var result = activity.result;
-        var attachment = new Attachment(result.blob, result.name);
+
+        if (Settings.mmsSizeLimitation &&
+          result.blob.size > Settings.mmsSizeLimitation &&
+          Utils.typeFromMimeType(result.blob.type) !== 'img') {
+          if (typeof requestProxy.onerror === 'function') {
+            requestProxy.onerror('file too large');
+          }
+          return;
+        }
 
         if (typeof requestProxy.onsuccess === 'function') {
-          requestProxy.onsuccess(attachment);
+          requestProxy.onsuccess(new Attachment(result.blob, {
+            name: result.name,
+            isDraft: true
+          }));
         }
       };
 
+      // Re-throw Gecko-level errors
       activity.onerror = function() {
         if (typeof requestProxy.onerror === 'function') {
-          requestProxy.onerror();
+          requestProxy.onerror.apply(requestProxy, arguments);
         }
       };
 
@@ -325,18 +668,9 @@ var Compose = (function() {
         return state.type;
       }
       if (value !== state.type) {
-        var event = new CustomEvent('type', {
-          cancelable: true
-        });
-        // store the old value in case of cancel
-        var oldValue = state.type;
+        var event = new CustomEvent('type');
         state.type = value;
-        trigger('type', event);
-        if (event.defaultPrevented) {
-          state.type = oldValue;
-        } else {
-          dom.form.dataset.messageType = state.type;
-        }
+        trigger.call(this, 'type', event);
       }
       return state.type;
     }
@@ -344,16 +678,41 @@ var Compose = (function() {
 
   Object.defineProperty(compose, 'size', {
     get: function composeGetSize() {
-      if (state.size !== null) {
-        return state.size;
+      if (state.size === null) {
+        state.size = this.getContent().reduce(function(sum, content) {
+          if (typeof content === 'string') {
+            return sum + content.length;
+          } else {
+            return sum + content.size;
+          }
+        }, 0);
       }
-      return state.size = this.getContent().reduce(function(sum, content) {
-        if (typeof content === 'string') {
-          return sum + content.length;
-        } else {
-          return sum + content.size;
-        }
-      }, 0);
+
+      return state.size;
+    }
+  });
+
+  Object.defineProperty(compose, 'isResizing', {
+    get: function composeGetResizeState() {
+      return state.resizing;
+    }
+  });
+
+  Object.defineProperty(compose, 'isSubjectVisible', {
+    get: function composeGetResizeState() {
+      return subject.isShowing;
+    }
+  });
+
+  Object.defineProperty(compose, 'subjectMaxLength', {
+    get: function composeGetResizeState() {
+      return subject.getMaxLength();
+    }
+  });
+
+  Object.defineProperty(compose, 'ignoreEvents', {
+    set: function composeIgnoreEvents(value) {
+      dom.message.classList.toggle('ignoreEvents', value);
     }
   });
 

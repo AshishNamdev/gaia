@@ -1,11 +1,14 @@
 'use strict';
 
+require('/shared/js/lazy_loader.js');
 requireApp('homescreen/test/unit/mock_app.js');
 requireApp('homescreen/test/unit/mock_request.html.js');
+requireApp('homescreen/test/unit/mock_lazy_loader.js');
 requireApp('homescreen/test/unit/mock_l10n.js');
 requireApp('homescreen/test/unit/mock_grid_manager.js');
 requireApp('homescreen/test/unit/mock_pagination_bar.js');
-requireApp('homescreen/test/unit/mock_manifest_helper.js');
+require('/shared/test/unit/mocks/mock_manifest_helper.js');
+requireApp('homescreen/js/grid_components.js');
 requireApp('homescreen/js/message.js');
 requireApp('homescreen/js/request.js');
 
@@ -14,7 +17,8 @@ requireApp('homescreen/js/homescreen.js');
 var mocksHelperForHome = new MocksHelper([
   'PaginationBar',
   'GridManager',
-  'ManifestHelper'
+  'ManifestHelper',
+  'LazyLoader'
 ]);
 mocksHelperForHome.init();
 
@@ -49,8 +53,21 @@ suite('homescreen.js >', function() {
   });
 
   test(' Homescreen displays a contextual menu for an app ', function() {
-    Homescreen.showAppDialog(new MockApp());
+    Homescreen.showAppDialog({
+      app: new MockApp(),
+      getName: function() {}
+    });
     assert.isTrue(dialog.classList.contains('visible'));
+  });
+
+  test(' Homescreen is listening online event ', function() {
+    window.dispatchEvent(new CustomEvent('online'));
+    assert.equal(document.body.dataset.online, 'online');
+  });
+
+  test(' Homescreen is listening offline event ', function() {
+    window.dispatchEvent(new CustomEvent('offline'));
+    assert.equal(document.body.dataset.online, 'offline');
   });
 
 });

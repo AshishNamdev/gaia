@@ -33,9 +33,7 @@
    */
   window.addEventListener('mute', function() {
     // Turn off vibration for really silence.
-    SettingsListener.getSettingsLock().set({
-      'vibration.enabled': false
-    });
+    setVibrationEnabled(false);
     enterSilentMode('notification');
   });
 
@@ -46,9 +44,7 @@
    */
   window.addEventListener('unmute', function() {
     // Turn on vibration.
-    SettingsListener.getSettingsLock().set({
-      'vibration.enabled': true
-    });
+    setVibrationEnabled(true);
     leaveSilentMode('notification');
     leaveSilentMode('content');
   });
@@ -58,6 +54,50 @@
   var currentChannel = 'none';
 
   var vibrationEnabled = true;
+  var vibrationUserPreference = (function() {
+    var _settingsKey = 'vibration.enabled';
+    var _preferenceKey = 'preference.vibration.enabled';
+    var _enabled = null;
+    var _obj = {
+      get enabled() {
+        if (_enabled === null) {
+          return true;
+        } else {
+          return _enabled;
+        }
+      },
+      set enabled(value) {
+        if (value != _enabled) {
+          window.asyncStorage.setItem(_preferenceKey, value,
+            function set_onsuccess() {
+              _enabled = value;
+          });
+        }
+      }
+    };
+
+    // initialize the value
+    window.asyncStorage.getItem(_preferenceKey, function get_onsuccess(value) {
+      if (value === null) {
+        var req = SettingsListener.getSettingsLock().get(_settingsKey);
+        req.onsuccess = function get_onsuccess() {
+          _enabled = req.result[_settingsKey];
+          if (_enabled == null) {
+            _enabled = true;
+          }
+          _obj.enabled = _enabled; // write back to async storage
+        };
+        req.onerror = function get_onerror() {
+          _enabled = true;
+          _obj.enabled = _enabled; // write back to async storage
+        };
+      } else {
+        _enabled = value;
+      }
+    });
+
+    return _obj;
+  })();
 
   // Cache the volume when entering silent mode.
   // Currently only two channel would be used for mute.
@@ -86,6 +126,18 @@
 
   var CACHE_CETIMES = 'CE_ACCTIME';
 
+  // Default volume control channel
+  // Possible values:
+  // * normal
+  // * content
+  // * notification
+  // * alarm
+  // * telephony
+  // * ringer
+  // * publicnotification
+  // * unknown
+  var defaultVolumeControlChannel = 'unknown';
+
   // This event is generated in shell.js in response to bluetooth headset.
   // Bluetooth headset always assign audio volume to a specific value when
   // pressing its volume-up/volume-down buttons.
@@ -99,6 +151,10 @@
     } else if (type == 'headphones-status-changed') {
       isHeadsetConnected = (e.detail.state != 'off');
       ceAccumulator();
+    } else if (type == 'default-volume-channel-changed') {
+      defaultVolumeControlChannel = e.detail.channel;
+      // Do not accumulate CE time here because this event
+      // doesn't mean the content is playing now.
     }
   });
 
@@ -108,7 +164,7 @@
       CEWarningVol = volume;
     });
 
-    window.asyncStorage.getItem(CACHE_CETIME,
+    window.asyncStorage.getItem(CACHE_CETIMES,
       function onGettingContentVolume(value) {
         if (!value) {
           return;
@@ -134,13 +190,12 @@
   }
 
   function headsetVolumeup() {
-    if (currentVolume[getChannel()] >= CEWarningVol &&
+    if ((currentVolume[getChannel()] + 1) >= CEWarningVol &&
         getChannel() == 'content') {
       if (CEAccumulatorTime == 0) {
         var okfn = function() {
           changeVolume(1);
           startAccumulator();
-          CustomDialog.hide();
         };
         resetToCEMaxVolume(okfn);
       } else {
@@ -153,28 +208,34 @@
   }
 
   function showCEWarningDialog(okfn) {
-    // show dialog
-    var cancel = {};
-    var confirm = {};
+    // Show dialog.
     var agreement = false;
-    cancel.title = navigator.mozL10n.get('cancel');
-    confirm.title = navigator.mozL10n.get('continue');
-    cancel.callback = function() {
-      CustomDialog.hide();
+    var _ = navigator.mozL10n.get;
+
+    var ceTitle = {
+      'icon': '/style/sound_manager/images/icon_Volumewarning.png',
+      'title': _('ceWarningtitle')
+    };
+    var ceMsg = _('ceWarningcontent');
+
+    var cancel = {
+      'title': _('ok')
     };
 
     if (okfn instanceof Function) {
-      confirm.callback = okfn;
+      cancel.callback = function onCancel() {
+        okfn();
+        CustomDialog.hide();
+      };
     } else {
-      confirm.callback = function() {
+      cancel.callback = function onCancel() {
         startAccumulator();
         CustomDialog.hide();
       };
     }
-    var ceTitle = navigator.mozL10n.get('ceWarningtitle');
-    var ceMsg = navigator.mozL10n.get('ceWarningcontent');
-    CustomDialog.show(ceTitle, ceMsg, cancel, confirm);
-   }
+
+    CustomDialog.show(ceTitle, ceMsg, cancel);
+  }
 
   function startAccumulator() {
     if (CEAccumulatorID == null) {
@@ -203,23 +264,23 @@
          CEAccumulatorTime = CEAccumulatorTime +
          (parseInt(new Date().getTime(), 10) - CETimestamp);
       }
-      window.asyncStorage.setItem(CACHE_CETIME, CEAccumulatorTime);
+      window.asyncStorage.setItem(CACHE_CETIMES, CEAccumulatorTime);
     }
   }
 
   function resetToCEMaxVolume(callback) {
-    pendingRequestCount++;
+    pendingRequest.v();
     var req = SettingsListener.getSettingsLock().set({
-      'audio.volume.content': CEWarningVol
+      'audio.volume.content': CEWarningVol - 1
     });
 
     req.onsuccess = function onSuccess() {
-      pendingRequestCount--;
+      pendingRequest.p();
       showCEWarningDialog(callback);
     };
 
     req.onerror = function onError() {
-      pendingRequestCount--;
+      pendingRequest.p();
       showCEWarningDialog(callback);
     };
   }
@@ -230,8 +291,16 @@
   window.addEventListener('appopen', function() {
     homescreenVisible = false;
   });
+  window.addEventListener('ftudone', function() {
+    // FTU closing implies we're going to homescreen.
+    homescreenVisible = true;
+  });
+  window.addEventListener('holdhome', function() {
+    CustomDialog.hide();
+  });
   window.addEventListener('home', function() {
     homescreenVisible = true;
+    CustomDialog.hide();
   });
 
   function onCall() {
@@ -268,46 +337,72 @@
     'content': 15,
     'bt_sco': 15
   };
-  var pendingRequestCount = 0;
+  var pendingRequest = new AsyncSemaphore();
+  var setVibrationEnabledCount = 0;
 
   // We have three virtual states here:
   // OFF -> VIBRATION -> MUTE
   var muteState = 'OFF';
 
-  for (var channel in currentVolume) {
-    (function(channel) {
-      var setting = 'audio.volume.' + channel;
-      SettingsListener.observe(setting, 5, function onSettingsChange(volume) {
-        if (pendingRequestCount)
-          return;
+  /*
+    Bind setting handlers
+    @param {Function} callback Callback being called after each setting handler
+                               has been invoked once.
+   */
+  (function bindVolumeSettingsHandlers(callback) {
+    var callsMade = 0;
+    var callbacksReceived = 0;
 
-        var max = MAX_VOLUME[channel];
-        currentVolume[channel] =
-            parseInt(Math.max(0, Math.min(max, volume)), 10);
+    for (var channel in currentVolume) {
+      callsMade++;
 
-        if (channel == 'content' && inited && volume > 0) {
-          leaveSilentMode('content',
-                          /* skip volume restore */ true);
-        } else if (channel == 'notification' && volume > 0) {
-          leaveSilentMode('notification',
-                          /* skip volume restore */ true);
-        } else if (channel == 'content' && volume == 0) {
-          // Enter silent mode when notification volume is 0
-          // no matter who sets this value.
-          enterSilentMode('notification');
-        }
+      (function(channel) {
+        var setting = 'audio.volume.' + channel;
+        SettingsListener.observe(setting, 5, function onSettingsChange(volume) {
+          var settingsChange = function settings_change() {
+            var max = MAX_VOLUME[channel];
+            currentVolume[channel] =
+              parseInt(Math.max(0, Math.min(max, volume)), 10);
 
-        if (!inited)
-          fetchCachedVolume();
-      });
-    })(channel);
-  }
+            if (channel === 'content' && inited && volume > 0) {
+              leaveSilentMode('content',
+                              /* skip volume restore */ true);
+            } else if (channel === 'notification' && volume > 0) {
+              leaveSilentMode('notification',
+                              /* skip volume restore */ true);
+            } else if (channel === 'notification' && volume == 0) {
+              // Enter silent mode when notification volume is 0
+              // no matter who sets this value.
+              enterSilentMode('notification');
+            }
+
+            if (!inited && ++callbacksReceived === callsMade)
+              callback();
+          };
+
+          // Initial loaded setting should always pass through (one per channel)
+          pendingRequest.wait(settingsChange, this);
+        });
+      })(channel);
+    }
+  })(fetchCachedVolume);
 
   SettingsListener.observe('vibration.enabled', true, function(vibration) {
-    if (pendingRequestCount)
-      return;
-
-    vibrationEnabled = vibration;
+    var setBySelf = false,
+      toggleVibrationEnabled = function toggle_vibration_enabled() {
+        // XXX: If the value does not set by sound manager,
+        //      we assume it comes from
+        //      the settings app and consider it as user preference.
+        if (!setBySelf) {
+          vibrationUserPreference.enabled = vibration;
+        }
+        vibrationEnabled = vibration;
+      };
+    if (setVibrationEnabledCount > 0) {
+      setVibrationEnabledCount--;
+      setBySelf = true;
+    }
+    pendingRequest.wait(toggleVibrationEnabled, this);
   });
 
   // Fetch stored volume if it exists.
@@ -321,18 +416,18 @@
       return;
 
     inited = true;
-    pendingRequestCount += cachedChannels.length;
+    pendingRequest.v(cachedChannels.length);
     cachedChannels.forEach(
       function iterator(channel) {
         window.asyncStorage.getItem('content.volume',
           function onGettingCachedVolume(value) {
             if (!value) {
-              pendingRequestCount--;
+              pendingRequest.p();
               return;
             }
 
             cachedVolume[channel] = value;
-            pendingRequestCount--;
+            pendingRequest.p();
           });
       });
   }
@@ -361,22 +456,59 @@
       case 'ringer':
           return 'notification';
       default:
-        return homescreenVisible ? 'notification' : 'content';
+        if (defaultVolumeControlChannel !== 'unknown') {
+          return defaultVolumeControlChannel;
+        } else {
+          return homescreenVisible ||
+            (window.lockScreen && window.lockScreen.locked) ||
+            FtuLauncher.isFtuRunning() ? 'notification' : 'content';
+        }
     }
   }
 
-  function getVolumeState(currentVolume, delta, channel) {
+  function calculateVolume(currentVolume, delta, channel) {
+    var volume = currentVolume;
     if (channel == 'notification') {
-      if (currentVolume + delta <= 0) {
-        if (currentVolume == 0 && vibrationEnabled) {
-          vibrationEnabled = false;
-        } else if (currentVolume > 0 && !vibrationEnabled) {
-          vibrationEnabled = true;
-        }
-        return 'MUTE';
-      } else {
-        return 'OFF';
+      if (volume == 0 && !vibrationEnabled) {
+        // This is for voluming up from Silent to Vibrate.
+        // Let's take -1 as the silent state and
+        // 0 as the vibrate state for easier calculation here.
+        volume = -1;
       }
+      volume += delta;
+    } else {
+      volume += delta;
+    }
+    return volume;
+  }
+
+  function getVibrationAndMuteState(currentVolume, delta, channel) {
+    if (channel == 'notification') {
+      var state;
+      var volume = currentVolume;
+      if (volume == 0 && !vibrationEnabled) {
+        // This is for voluming up from Silent to Vibrate.
+        // Let's take -1 as the silent state and
+        // 0 as the vibrate state for easier calculation here.
+        volume = -1;
+      }
+      volume += delta;
+
+      if (volume < 0) {
+        state = 'MUTE';
+        vibrationEnabled = false;
+      } else if (volume == 0) {
+        state = 'MUTE';
+        vibrationEnabled = true;
+      } else {
+        // Restore the vibration setting only when leaving silent mode.
+        if (currentVolume <= 0) {
+          vibrationEnabled = vibrationUserPreference.enabled;
+        }
+        state = 'OFF';
+      }
+
+      return state;
     } else {
       if (currentVolume + delta <= 0) {
         return 'MUTE';
@@ -397,14 +529,14 @@
     var isCachedAlready =
       (cachedVolume[channel] == currentVolume[channel]);
     cachedVolume[channel] = currentVolume[channel];
-    pendingRequestCount++;
+    pendingRequest.v();
+
     var settingObject = {};
     settingObject['audio.volume.' + channel] = 0;
     var req = SettingsListener.getSettingsLock().set(settingObject);
 
     req.onsuccess = function onSuccess() {
-      pendingRequestCount--;
-
+      pendingRequest.p();
       // Write to async storage only happens when
       // we haven't stored it before.
       // If the user presses the volume rockers repeatedly down and up,
@@ -415,7 +547,7 @@
     };
 
     req.onerror = function onError() {
-      pendingRequestCount--;
+      pendingRequest.p();
     };
   }
 
@@ -440,15 +572,15 @@
       settingObject['audio.volume.' + channel] =
         (cachedVolume[channel] > 0) ? cachedVolume[channel] : 1;
 
-      pendingRequestCount++;
+      pendingRequest.v();
       req = SettingsListener.getSettingsLock().set(settingObject);
 
       req.onsuccess = function onSuccess() {
-        pendingRequestCount--;
+        pendingRequest.p();
       };
 
       req.onerror = function onError() {
-        pendingRequestCount--;
+        pendingRequest.p();
       };
     }
 
@@ -458,9 +590,10 @@
   function changeVolume(delta, channel) {
     channel = channel ? channel : getChannel();
 
-    muteState = getVolumeState(currentVolume[channel], delta, channel);
-
-    var volume = currentVolume[channel] + delta;
+    var vibrationEnabledOld = vibrationEnabled;
+    var volume = calculateVolume(currentVolume[channel], delta, channel);
+    muteState =
+      getVibrationAndMuteState(currentVolume[channel], delta, channel);
 
     // Silent mode entry point
     if (volume <= 0 && delta < 0 && channel == 'notification') {
@@ -487,28 +620,20 @@
     switch (muteState) {
       case 'OFF':
         classes.remove('mute');
-        if (vibrationEnabled) {
-          classes.add('vibration');
-        } else {
-          classes.remove('vibration');
-        }
         break;
       case 'MUTE':
         classes.add('mute');
-        if (channel == 'notification') {
-          if (vibrationEnabled) {
-            classes.add('vibration');
-            SettingsListener.getSettingsLock().set({
-                'vibration.enabled': true
-            });
-          } else {
-            classes.remove('vibration');
-            SettingsListener.getSettingsLock().set({
-                'vibration.enabled': false
-            });
-          }
-        }
         break;
+    }
+
+    if (vibrationEnabled) {
+      classes.add('vibration');
+    } else {
+      classes.remove('vibration');
+    }
+
+    if (vibrationEnabledOld != vibrationEnabled) {
+      setVibrationEnabled(vibrationEnabled);
     }
 
     var steps =
@@ -537,7 +662,8 @@
     if (!window.navigator.mozSettings)
       return;
 
-    pendingRequestCount++;
+    pendingRequest.v();
+
     var req;
 
     notification.dataset.channel = channel;
@@ -548,12 +674,19 @@
     req = SettingsListener.getSettingsLock().set(settingObject);
 
     req.onsuccess = function onSuccess() {
-      pendingRequestCount--;
+      pendingRequest.p();
     };
 
     req.onerror = function onError() {
-      pendingRequestCount--;
+      pendingRequest.p();
     };
+  }
+
+  function setVibrationEnabled(enabled) {
+    setVibrationEnabledCount++;
+    SettingsListener.getSettingsLock().set({
+      'vibration.enabled': enabled
+    });
   }
 })();
 

@@ -17,7 +17,6 @@ suiteGroup('Provider.Caldav', function() {
   var eventStore;
 
   setup(function(done) {
-    this.timeout(10000);
     app = testSupport.calendar.app();
     controller = app.serviceController;
     db = app.db;
@@ -54,7 +53,6 @@ suiteGroup('Provider.Caldav', function() {
 
   var ical;
   suiteSetup(function(done) {
-    this.timeout(10000);
     ical = new ServiceSupport.Fixtures('ical');
     ical.load('daily_event');
     ical.load('recurring_event');
@@ -740,11 +738,14 @@ suiteGroup('Provider.Caldav', function() {
       });
 
       test('result', function(done) {
+        var isAsync = false;
         // tokens match should not sync!
         subject.syncEvents(account, calendar, function() {
           assert.ok(!calledWith);
+          assert.ok(isAsync, 'should be async');
           done();
         });
+        isAsync = true;
       });
 
       test('offline handling', function(done) {

@@ -29,7 +29,7 @@ var TelephonyTab = (function() {
       window.addEventListener('localized', localize);
 
       // Configure updates
-      document.addEventListener('mozvisibilitychange', updateWhenVisible, true);
+      document.addEventListener('visibilitychange', updateWhenVisible, true);
       ConfigManager.observe('lastTelephonyActivity', updateCounters, true);
       ConfigManager.observe('lastTelephonyReset', updateUI, true);
       ConfigManager.observe('nextReset', updateNextReset, true);
@@ -50,7 +50,7 @@ var TelephonyTab = (function() {
       return;
     }
 
-    document.removeEventListener('mozvisibilitychange', updateWhenVisible);
+    document.removeEventListener('visibilitychange', updateWhenVisible);
     ConfigManager.removeObserver('lastTelephonyActivity', updateCounters);
     ConfigManager.removeObserver('lastTelephonyReset', updateUI);
     ConfigManager.removeObserver('nextReset', updateNextReset);
@@ -59,14 +59,15 @@ var TelephonyTab = (function() {
   }
 
   function updateWhenVisible() {
-    if (!document.mozHidden && initialized) {
+    if (!document.hidden && initialized) {
       updateUI();
     }
   }
 
   function updateUI() {
     var requestObj = { type: 'telephony' };
-    ConfigManager.requestSettings(function _onSettings(settings) {
+    ConfigManager.requestSettings(Common.dataSimIccId,
+                                  function _onSettings(settings) {
       costcontrol.request(requestObj, function _afterRequest(result) {
         var telephonyActivity = result.data;
         debug('Last telephony activity:', telephonyActivity);

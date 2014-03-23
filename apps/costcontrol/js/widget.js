@@ -1,4 +1,9 @@
+/* global _, debug, BalanceView, checkDataUsageNotification,
+         ConfigManager, Common, computeTelephonyMinutes, CostControl,
+          formatTimeHTML, getDataLimit, MozActivity, roundData, SettingsListener
+*/
 
+/* exported activity */
 /*
  * The widget is in charge of show balance, telephony data and data usage
  * statistics depending on the SIM inserted.
@@ -8,47 +13,56 @@
  * a balance update or timeout.
  */
 
-(function() {
+var Widget = (function() {
 
   'use strict';
 
-  // XXX: This is the point of entry, check common.js for more info
-  waitForDOMAndMessageHandler(window, onReady);
-
   var costcontrol;
-  function onReady() {
-    var mobileConnection = window.navigator.mozMobileConnection;
+  function checkSIMStatus() {
+
+    var mobileConnection = window.navigator.mozMobileConnections;
+
+    if (!mobileConnection) {
+      console.error('No mozMobileConnection available');
+      return;
+    }
+    var iccid = Common.dataSimIccId;
+    var dataSimIccInfo = Common.dataSimIcc;
     var cardState = checkCardState();
-    var iccid = mobileConnection.iccInfo.iccid;
+
+    if (!dataSimIccInfo || !dataSimIccInfo.iccInfo) {
+      debug('ICC info not ready yet.');
+      dataSimIccInfo.oniccinfochange = checkSIMStatus;
 
     // SIM not ready
-    if (cardState !== 'ready') {
-      debug('SIM not ready:', mobileConnection.cardState);
-      mobileConnection.oncardstatechange = onReady;
+    } else if (cardState !== 'ready') {
+      debug('SIM not ready:', dataSimIccInfo.cardState);
+      initialized = false;
+      dataSimIccInfo.oncardstatechange = checkSIMStatus;
 
     // SIM is ready, but ICC info is not ready yet
-    } else if (iccid === null) {
+    } else if (!Common.isValidICCID(iccid)) {
       debug('ICC info not ready yet');
-      mobileConnection.oniccinfochange = onReady;
+      dataSimIccInfo.oniccinfochange = checkSIMStatus;
 
     // All ready
     } else {
       debug('SIM ready. ICCID:', iccid);
-      mobileConnection.oncardstatechange = undefined;
-      mobileConnection.oniccinfochange = undefined;
-      startWidget();
+      dataSimIccInfo.oncardstatechange = undefined;
+      dataSimIccInfo.oniccinfochange = undefined;
+      document.getElementById('message-handler').src = 'message_handler.html';
+      Common.waitForDOMAndMessageHandler(window, startWidget);
     }
-  };
+  }
 
   // Check the card status. Return 'ready' if all OK or take actions for
   // special situations such as 'pin/puk locked' or 'absent'.
   function checkCardState() {
-    var mobileConnection = window.navigator.mozMobileConnection;
     var state, cardState;
-    state = cardState = mobileConnection.cardState;
+    state = cardState = Common.dataSimIcc.cardState;
 
     // SIM is absent
-    if (cardState === 'absent') {
+    if (!cardState || cardState === 'absent') {
       debug('There is no SIM');
       showSimError('no-sim2');
 
@@ -65,13 +79,14 @@
   }
 
   function startWidget() {
+
     function _onNoICCID() {
-      console.error('checkSIMChange() failed. Impossible to ensure consistent' +
+      console.error('checkSIM() failed. Impossible to ensure consistent' +
                     'data. Aborting start up.');
       showSimError('no-sim2');
     }
 
-    checkSIMChange(function _onSIMChecked() {
+    Common.checkSIM(function _onSIMChecked() {
       CostControl.getInstance(function _onCostControlReady(instance) {
         costcontrol = instance;
         setupWidget();
@@ -86,6 +101,7 @@
   });
 
   var initialized, widget, leftPanel, rightPanel, fte, views = {};
+  var balanceView;
   function setupWidget() {
     // HTML entities
     widget = document.getElementById('cost-control');
@@ -101,14 +117,23 @@
     ConfigManager.observe('lastBalance', onBalance, true);
     ConfigManager.observe('waitingForBalance', onErrors, true);
     ConfigManager.observe('errors', onErrors, true);
-    ConfigManager.observe('lastDataReset', onReset, true);
+    ConfigManager.observe('lastCompleteDataReset', onReset, true);
     ConfigManager.observe('lastTelephonyReset', onReset, true);
 
+    // Subviews
+    var balanceConfig = ConfigManager.configuration.balance;
+    balanceView = new BalanceView(
+      document.getElementById('balance-credit'),
+      document.querySelector('#balance-credit + .meta'),
+      balanceConfig ? balanceConfig.minimum_delay : undefined
+    );
+
     // Update UI when visible
-    document.addEventListener('mozvisibilitychange',
+    document.addEventListener('visibilitychange',
       function _onVisibilityChange(evt) {
-        if (!document.mozHidden && initialized &&
-            checkCardState() === 'ready') {
+        if (!document.hidden && initialized &&
+            (AirplaneModeHelper.getStatus() === 'disabled')) {
+          checkCardState(Common.dataSimIccId);
           updateUI();
         }
       }
@@ -138,8 +163,14 @@
       }
     );
 
-    initialized = true;
     updateUI();
+
+    // Refresh UI when the user changes the SIM for data connections
+    SettingsListener.observe('ril.data.defaultServiceId', 0, function() {
+      Common.loadDataSIMIccId(updateUI.bind(null, true));
+    });
+
+    initialized = true;
   }
 
   // BALANCE ACTIONS
@@ -154,7 +185,7 @@
 
   // On balance update fail
   function onErrors(errors, old, key, settings) {
-    if (!errors['BALANCE_TIMEOUT']) {
+    if (!errors || !errors['BALANCE_TIMEOUT']) {
       return;
     }
     debug('Balance timeout!');
@@ -173,18 +204,22 @@
 
   // Reuse fte panel to display errors
   function showSimError(status) {
-    var fte = document.getElementById('fte-view');
-    var leftPanel = document.getElementById('left-panel');
-    var rightPanel = document.getElementById('right-panel');
+    // Wait to l10n resources are ready
+    navigator.mozL10n.ready(function showErrorStatus() {
+      var fte = document.getElementById('fte-view');
+      var leftPanel = document.getElementById('left-panel');
+      var rightPanel = document.getElementById('right-panel');
 
-    fte.setAttribute('aria-hidden', false);
-    leftPanel.setAttribute('aria-hidden', true);
-    rightPanel.setAttribute('aria-hidden', true);
+      fte.setAttribute('aria-hidden', false);
+      leftPanel.setAttribute('aria-hidden', true);
+      rightPanel.setAttribute('aria-hidden', true);
 
-    var className = 'widget-' + status;
-    document.getElementById('fte-icon').classList.add(className);
-    fte.querySelector('p:first-child').textContent = _(className + '-heading');
-    fte.querySelector('p:last-child').textContent = _(className + '-meta');
+      var className = 'widget-' + status;
+      document.getElementById('fte-icon').classList.add(className);
+      Common.localize(fte.querySelector('p:first-child'), className +
+        '-heading');
+      Common.localize(fte.querySelector('p:last-child'), className + '-meta');
+    });
   }
 
   function setupFte(provider, mode) {
@@ -206,15 +241,19 @@
     var simKey = keyLookup[mode];
 
     document.getElementById('fte-icon').className = 'icon ' + simKey;
-    fte.querySelector('p:first-child').textContent = _(simKey + '-heading',
-                                                     { provider: provider });
-    fte.querySelector('p:last-child').textContent = _(simKey + '-meta');
+    Common.localize(
+      fte.querySelector('p:first-child'),
+      simKey + '-heading',
+      {provider: provider}
+    );
+    Common.localize(fte.querySelector('p:last-child'), simKey + '-meta');
   }
 
   var hashMark = 0;
   function updateUI(updateOnlyDataUsage) {
+
     ConfigManager.requestAll(function _onInfo(configuration, settings) {
-      var mode = costcontrol.getApplicationMode(settings);
+      var mode = ConfigManager.getApplicationMode();
       debug('Widget UI mode:', mode);
 
       var isPrepaid = (mode === 'PREPAID');
@@ -296,9 +335,15 @@
             value: limitText[0],
             unit: limitText[1]
           });
-          leftTag.textContent = limitTresspased ? _('limit-passed') : _('used');
+          Common.localize(
+            leftTag,
+            limitTresspased ? 'limit-passed' : 'used'
+          );
           leftValue.textContent = limitTresspased ? limitText : currentText;
-          rightTag.textContent = limitTresspased ? _('used') : _('limit');
+          Common.localize(
+            rightTag,
+            limitTresspased ? 'used' : 'limit'
+          );
           rightValue.textContent = limitTresspased ? currentText : limitText;
 
         } else {
@@ -309,14 +354,9 @@
           meta.innerHTML = '';
           meta.appendChild(formatTimeHTML(stats.timestamp));
         }
-        checkDataUsageNotification(settings, stats.mobile.total,
-          // inform driver in system we are finished to update the widget
-          function _done() {
-            debug('Data usage notification checked!');
-            hashMark = 1 - hashMark; // toogle between 0 and 1
-            window.location.hash = '#updateDone#' + hashMark;
-          }
-        );
+        // inform driver in system we are finished to update the widget
+        hashMark = 1 - hashMark; // toogle between 0 and 1
+        window.location.hash = '#updateDone#' + hashMark;
       });
 
       // Content for balance or telephony
@@ -363,29 +403,14 @@
   // Update the balance in balance view
   function updateBalance(balance, limit) {
 
-    // Balance not available
-    if (balance === null) {
-      debug('Balance not available.');
-      document.getElementById('balance-credit')
-        .textContent = _('not-available');
-      views.balance.querySelector('.meta').innerHTML = '';
+    if (!balance) {
+      debug('Balance not available');
+      balanceView.update();
       return;
     }
 
-    // Balance available
-    document.getElementById('balance-credit').textContent = _('currency', {
-      value: balance.balance,
-      currency: ConfigManager.configuration.credit.currency
-    });
-
-    // Timestamp
-    var meta = views.balance.querySelector('.meta');
-    if (views.balance.classList.contains('updating')) {
-      meta.textContent = _('updating-ellipsis');
-    } else {
-      meta.innerHTML = '';
-      meta.appendChild(formatTimeHTML(balance.timestamp));
-    }
+    var isUpdating = views.balance.classList.contains('updating');
+    balanceView.update(balance, isUpdating);
 
     // Limits: reaching zero / low limit
     if (balance.balance === 0) {
@@ -422,5 +447,50 @@
       views.balance.classList.add('updating');
     }
   }
+  function initWidget() {
+    Common.loadDataSIMIccId(checkSIMStatus, function _errorNoSim() {
+      var errorMessageId = (AirplaneModeHelper.getStatus() === 'enabled') ?
+                           'airplane-mode' : 'no-sim2';
+      console.warn('Error when trying to get the ICC ID');
+      showSimError(errorMessageId);
+    });
+    AirplaneModeHelper.addEventListener('statechange',
+      function _onAirplaneModeChange(state) {
+        if (state === 'enabled') {
+          var iccManager = window.navigator.mozIccManager;
+          iccManager.addEventListener('iccdetected',
+            function _oniccdetected() {
+              iccManager.removeEventListener('iccdetected', _oniccdetected);
+              Common.loadDataSIMIccId(checkSIMStatus);
+            }
+          );
+          showSimError('airplane-mode');
+        }
+      }
+    );
+
+    // XXX: See bug 944342 -[Cost control] move all the process related to the
+    // network and data interfaces loading to the start-up process of CC
+    Common.loadNetworkInterfaces();
+  }
+
+  return {
+    init: function() {
+        var SCRIPTS_NEEDED = [
+        'js/utils/debug.js',
+        'js/utils/formatting.js',
+        'js/utils/toolkit.js',
+        'js/common.js',
+        'js/costcontrol.js',
+        'js/costcontrol_init.js',
+        'js/config/config_manager.js',
+        'js/settings/networkUsageAlarm.js',
+        'js/views/BalanceView.js'
+      ];
+      LazyLoader.load(SCRIPTS_NEEDED, initWidget);
+    }
+  };
 
 }());
+
+Widget.init();

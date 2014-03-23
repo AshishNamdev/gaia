@@ -14,9 +14,10 @@
 const MEDIA_TYPE = ['music', 'pictures', 'videos', 'sdcard'];
 const ITEM_TYPE = ['music', 'pictures', 'videos', 'free'];
 
-var Volume = function(index, name, storages) {
-  this.index = index;
+var Volume = function(name, external, externalIndex, storages) {
   this.name = name;
+  this.external = external;
+  this.externalIndex = externalIndex;
   this.storages = storages;
   this.rootElement = null;  //<ul></ul>
   this.stackedbar = null;
@@ -26,7 +27,7 @@ var Volume = function(index, name, storages) {
 // the DOM structure looks like:
 //
 //<header>
-//  <h2 data-l10n-id="storage-name-sdcard">Internal Storage</h2>
+//  <h2 data-l10n-id="storage-name-internal">Internal Storage</h2>
 //</header>
 //<ul>
 //  <li>
@@ -59,20 +60,42 @@ var Volume = function(index, name, storages) {
 //    </a>
 //  </li>
 //  <li>
-//    <label>
-//      <input type="checkbox" data-type="switch"
-//        name="ums.volume.sdcard.enabled" />
-//      <span></span>
+//    <span></span>
+//    <a data-l10n-id="total-space">Total space
+//      <span class="size"></span>
+//    </a>
+//  </li>
+//  <label>
+//    <button data-l10n-id="format-sdcard" disabled="true">
+//    Format SD card
+//    </button>
+//  </label>
+// </li>
+//  <li>
+//    <label class="pack-switch">
+//      <input type="checkbox" name="ums.volume.sdcard.enabled" />
+//      <span data-l10n-id="share-using-usb">Share using USB</span>
 //    </label>
-//    <a data-l10n-id="share-using-usb">Share using USB</a>
 //  </li>
 //</ul>
 
+Volume.prototype.getL10nId = function volume_getL10nId(useShort) {
+  var prefix = useShort ? 'short-storage-name-' : 'storage-name-';
+  if (this.external) {
+    return prefix + 'external-' + this.externalIndex;
+  } else {
+    return prefix + 'internal';
+  }
+};
+
 Volume.prototype.createView = function volume_createView(listRoot) {
   var _ = navigator.mozL10n.get;
+  // declair re-useable variables
+  var l10nId, li, label, text, size;
+
   // create header
   var h2 = document.createElement('h2');
-  var l10nId = 'storage-name-' + this.index;
+  l10nId = this.getL10nId();
   h2.dataset.l10nId = l10nId;
   h2.textContent = _(l10nId);
   var header = document.createElement('header');
@@ -85,58 +108,85 @@ Volume.prototype.createView = function volume_createView(listRoot) {
   var stackedbarDiv = document.createElement('div');
   stackedbarDiv.id = this.name + '-space-stackedbar';
   stackedbarDiv.classList.add('space-stackedbar');
-  var li = document.createElement('li');
+  li = document.createElement('li');
   li.appendChild(stackedbarDiv);
   this.rootElement.appendChild(li);
   this.stackedbar = StackedBar(stackedbarDiv);
 
   var self = this;
   ITEM_TYPE.forEach(function(type) {
-    var label = document.createElement('span');
+    label = document.createElement('span');
     label.classList.add('stackedbar-color-label');
-    var size = document.createElement('span');
+    size = document.createElement('span');
     size.classList.add('size');
-    var text = document.createElement('a');
-    var l10nId = type + '-space';
+    text = document.createElement('a');
+    l10nId = type + '-space';
     text.dataset.l10nId = l10nId;
     text.textContent = _(l10nId);
     text.appendChild(size);
-    var li = document.createElement('li');
+    li = document.createElement('li');
     li.classList.add('color-' + type);
     li.appendChild(label);
     li.appendChild(text);
     self.rootElement.appendChild(li);
   });
 
+  size = document.createElement('span');
+  size.classList.add('size');
+  text = document.createElement('a');
+  l10nId = 'total-space';
+  text.dataset.l10nId = l10nId;
+  text.textContent = _(l10nId);
+  text.appendChild(size);
+  li = document.createElement('li');
+  li.appendChild(text);
+  this.rootElement.appendChild(li);
+
+  var buttonType = 'format-sdcard';
+  var button = document.createElement('button');
+  button.dataset.l10nId = buttonType;
+  button.textContent = _(buttonType);
+  button.disabled = true;
+  button.onclick = this.formatSDCard.bind(this);
+  label = document.createElement('label');
+  label.appendChild(button);
+  li = document.createElement('li');
+  li.appendChild(label);
+  this.rootElement.appendChild(li);
+
   var input = document.createElement('input');
   input.type = 'checkbox';
-  input.dataset.type = 'switch';
   input.name = 'ums.volume.' + this.name + '.enabled';
-  var span = document.createElement('span');
-  var label = document.createElement('label');
+  label = document.createElement('label');
+  label.classList.add('pack-switch');
   label.appendChild(input);
+  var span = document.createElement('span');
+  span.dataset.l10nId = 'share-using-usb';
+  span.textContent = _('share-using-usb');
   label.appendChild(span);
-  var text = document.createElement('a');
-  text.dataset.l10nId = 'share-using-usb';
-  text.textContent = _('share-using-usb');
 
   var ele = document.createElement('li');
   ele.appendChild(label);
-  ele.appendChild(text);
   this.rootElement.appendChild(ele);
 };
 
 Volume.prototype.updateStorageInfo = function volume_updateStorageInfo() {
   // Update the storage details
   var self = this;
-  this.stackedbar.reset();
   this.getStats(function(sizes) {
+    self.stackedbar.reset();
     ITEM_TYPE.forEach(function(type) {
       var element = self.rootElement.querySelector('.color-' + type + ' .size');
       DeviceStorageHelper.showFormatedSize(element, 'storageSize', sizes[type]);
       self.stackedbar.add({ 'type': type, 'value': sizes[type] });
     });
     self.stackedbar.refreshUI();
+
+    // update total space size
+    var element =
+      self.rootElement.querySelector('a[data-l10n-id="total-space"] .size');
+    DeviceStorageHelper.showFormatedSize(element, 'storageSize',
+                                         sizes['sdcard'] + sizes['free']);
   });
 };
 
@@ -167,13 +217,13 @@ Volume.prototype.updateInfo = function volume_updateInfo(callback) {
     var state = evt.target.result;
     switch (state) {
       case 'shared':
-        self.setInfoUnavailable();
-        break;
       case 'unavailable':
         self.setInfoUnavailable();
+        self.enableFormatSDCardBtn(false);
         break;
       case 'available':
         self.updateStorageInfo();
+        self.enableFormatSDCardBtn(true);
         break;
     }
     if (callback)
@@ -190,7 +240,50 @@ Volume.prototype.setInfoUnavailable = function volume_setInfoUnavailable() {
     element.textContent = _('size-not-available');
     element.dataset.l10nId = 'size-not-available';
   });
+  // set total space info.
+  var element =
+    this.rootElement.querySelector('a[data-l10n-id="total-space"] .size');
+  element.textContent = _('size-not-available');
+  element.dataset.l10nId = 'size-not-available';
+  // stacked bar reset
   this.stackedbar.reset();
+};
+
+Volume.prototype.formatSDCard = function volume_formatSDCard(evt) {
+  // Pop up a confirm window before format SD card.
+  var popup = document.getElementById('format-sdcard-dialog');
+  var cancelBtn = document.getElementById('format-sdcard-cancel-btn');
+  var okBtn = document.getElementById('format-sdcard-ok-btn');
+
+  var self = this;
+  var confirmHandler = function() {
+    enablePopup(false);
+    // Format SD card
+    self.storages.sdcard.format();
+  };
+
+  var cancelHandler = function() {
+    enablePopup(false);
+  };
+
+  var enablePopup = function Vf_enablePopup(enabled) {
+    if (enabled) {
+      okBtn.addEventListener('click', confirmHandler);
+      cancelBtn.addEventListener('click', cancelHandler);
+      popup.hidden = false;
+    } else {
+      okBtn.removeEventListener('click', confirmHandler);
+      cancelBtn.removeEventListener('click', cancelHandler);
+      popup.hidden = true;
+    }
+  };
+  enablePopup(true);
+};
+
+Volume.prototype.enableFormatSDCardBtn =
+  function volume_enableFormatSDCardBtn(enabled) {
+    var rule = 'button[data-l10n-id="format-sdcard"]';
+    this.rootElement.querySelector(rule).disabled = !enabled;
 };
 
 var MediaStorage = {
@@ -202,9 +295,9 @@ var MediaStorage = {
 
     this.usmEnabledVolume = {};
     this.umsVolumeShareState = false;
-    // Use mozvisibilitychange so that we don't get notified of device
+    // Use visibilitychange so that we don't get notified of device
     // storage notifications when the settings app isn't visible.
-    document.addEventListener('mozvisibilitychange', this);
+    document.addEventListener('visibilitychange', this);
     this.umsEnabledCheckBox = document.getElementById('ums-switch');
     this.umsEnabledInfoBlock = document.getElementById('ums-desc');
     this.umsEnabledCheckBox.addEventListener('change', this);
@@ -232,21 +325,33 @@ var MediaStorage = {
 
   initAllVolumeObjects: function ms_initAllVolumeObjects() {
     var volumes = {};
+    var totalVolumes = 0;
     MEDIA_TYPE.forEach(function(type) {
       var storages = navigator.getDeviceStorages(type);
       storages.forEach(function(storage) {
         var name = storage.storageName;
         if (!volumes.hasOwnProperty(name)) {
           volumes[name] = {};
+          totalVolumes++;
         }
         volumes[name][type] = storage;
       });
     });
-    var _ = navigator.mozL10n.get;
+
     var volumeList = [];
+    var externalIndex = 0;
     var volumeListRootElement = document.getElementById('volume-list');
     for (var name in volumes) {
-      var volume = new Volume(volumeList.length, name, volumes[name]);
+      var volume;
+      // XXX: This is a heuristic to determine whether a storage is internal or
+      // external (e.g. a pluggable SD card). It does *not* work in general, but
+      // it works for all officially-supported devices.
+      if (totalVolumes > 1 && name === 'sdcard') {
+        volume = new Volume(name, false /* internal */, 0, volumes[name]);
+      } else {
+        volume = new Volume(name, true /* external */, externalIndex++,
+                            volumes[name]);
+      }
       volume.createView(volumeListRootElement);
       volumeList.push(volume);
     }
@@ -256,16 +361,16 @@ var MediaStorage = {
   registerUmsListener: function ms_registerUmsListener() {
     var self = this;
     var settings = Settings.mozSettings;
-    this._volumeList.forEach(function(volume) {
+    this._volumeList.forEach(function(volume, index) {
       var key = 'ums.volume.' + volume.name + '.enabled';
       Settings.getSettings(function(allSettings) {
         var input = document.querySelector('input[name="' + key + '"]');
         input.checked = allSettings[key] || false;
-        self.usmEnabledVolume[volume.index] = input.checked;
+        self.usmEnabledVolume[index] = input.checked;
         self.updateMasterUmsDesc();
       });
       settings.addObserver(key, function(evt) {
-        self.usmEnabledVolume[volume.index] = evt.settingValue;
+        self.usmEnabledVolume[index] = evt.settingValue;
         self.updateMasterUmsDesc();
       });
     });
@@ -277,7 +382,7 @@ var MediaStorage = {
       var list = [];
       for (var id in this.usmEnabledVolume) {
         if (this.usmEnabledVolume[id]) {
-          list.push(_('short-storage-name-' + id));
+          list.push(_(this._volumeList[id].getL10nId(true)));
         }
       }
       if (list.length === 0) {
@@ -314,7 +419,7 @@ var MediaStorage = {
       case 'click':
         this.changeDefaultStorage();
         break;
-      case 'mozvisibilitychange':
+      case 'visibilitychange':
         this.updateListeners(this.updateInfo.bind(this));
         break;
     }
@@ -331,7 +436,7 @@ var MediaStorage = {
       self._volumeList.forEach(function(volume, index) {
         var option = document.createElement('option');
         option.value = volume.name;
-        var l10nId = 'short-storage-name-' + volume.index;
+        var l10nId = volume.getL10nId(true);
         option.dataset.l10nId = l10nId;
         option.textContent = _(l10nId);
         selectionMenu.appendChild(option);
@@ -342,11 +447,6 @@ var MediaStorage = {
       var selectedOption = selectionMenu.options[selectedIndex];
       selectedOption.selected = true;
 
-      // update fake selection button content
-      var button = selectionMenu.previousElementSibling;
-      button.textContent = selectedOption.textContent;
-      button.dataset.l10nId = selectedOption.dataset.l10nId;
-
       // disable option menu if we have only one option
       if (self._volumeList.length === 1) {
         selectionMenu.disabled = true;
@@ -356,6 +456,7 @@ var MediaStorage = {
       }
     });
   },
+
   changeDefaultStorage: function ms_changeDefaultStorage() {
     //Pop up a confirm window before listing options.
     var popup = document.getElementById('default-location-popup-container');
@@ -378,7 +479,7 @@ var MediaStorage = {
 
   updateListeners: function ms_updateListeners(callback) {
     var self = this;
-    if (document.mozHidden) {
+    if (document.hidden) {
       // Settings is being hidden. Unregister our change listener so we won't
       // get notifications whenever files are added in another app.
       if (this.documentStorageListener) {
@@ -398,7 +499,7 @@ var MediaStorage = {
         });
         this.documentStorageListener = true;
       }
-      if (callback && document.location.hash === '#mediaStorage')
+      if (callback && Settings.currentPanel === '#mediaStorage')
         callback();
     }
   },
@@ -433,12 +534,13 @@ var StackedBar = function(div) {
       items.forEach(function(item) {
         var className = 'color-' + item.type;
         var ele = container.querySelector('.' + className);
-        if (!ele)
+        if (!ele) {
           ele = document.createElement('span');
-        ele.classList.add(className);
-        ele.classList.add('stackedbar-item');
+          ele.classList.add(className);
+          ele.classList.add('stackedbar-item');
+          container.appendChild(ele);
+        }
         ele.style.width = (item.value * 100) / totalSize + '%';
-        container.appendChild(ele);
       });
     },
 

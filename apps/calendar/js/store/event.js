@@ -1,4 +1,5 @@
 (function(window) {
+  'use strict';
 
   function Events() {
     Calendar.Store.Abstract.apply(this, arguments);
@@ -47,7 +48,8 @@
      */
     _assignId: function(obj) {
       var id = obj.calendarId + '-' + obj.remote.id;
-      return obj._id = id;
+      obj._id = id;
+      return id;
     },
 
     /**
@@ -61,21 +63,6 @@
           owners.account.providerType
         ));
       });
-    },
-
-    busytimeIdFor: function(event, start, end) {
-      if (!start)
-        start = event.remote.start;
-
-      if (!end)
-        end = event.remote.end;
-
-
-      var id = start.utc + '-' +
-               end.utc + '-' +
-               event._id;
-
-      return id;
     },
 
     /**

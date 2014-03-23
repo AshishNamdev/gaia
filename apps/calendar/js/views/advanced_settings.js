@@ -1,4 +1,5 @@
 (function(window) {
+  'use strict';
 
   var ACCOUNT_PREFIX = 'account-';
   var template = Calendar.Templates.Account;
@@ -71,7 +72,7 @@
 
       account.on('add', this._addAccount.bind(this));
       account.on('update', this._updateAccount.bind(this));
-      account.on('remove', this._removeAccount.bind(this));
+      account.on('preRemove', this._removeAccount.bind(this));
 
       setting.on('syncFrequencyChange', this);
       this.syncFrequency.addEventListener('change', this);
@@ -91,14 +92,15 @@
     handleSettingUiChange: function(type, value) {
       var store = this.app.store('Setting');
       // basic conversions
-      if (value === 'null')
+      if (value === 'null') {
         value = null;
+      }
 
       switch (type) {
         case 'alldayAlarmDefault':
         case 'standardAlarmDefault':
         case 'syncFrequency':
-          if (!value === null) {
+          if (value !== null) {
             value = parseInt(value);
           }
           store.set(type, value);

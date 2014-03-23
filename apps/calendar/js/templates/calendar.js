@@ -1,4 +1,5 @@
 (function(window) {
+  'use strict';
 
   var Cal = Calendar.Template.create({
     item: function() {
@@ -13,13 +14,12 @@
 
       return '<li id="calendar-' + id + '">' +
           '<div class="calendar-id-' + id + ' calendar-color"></div>' +
-          '<label>' +
-            '<span ' + l10n + ' class="name">' + this.h('name') + '</span>' +
+          '<label class="pack-checkbox">' +
             '<input ' +
               'value="' + id + '" ' +
               'type="checkbox" ' +
               this.bool('localDisplayed', 'checked') + ' />' +
-            '<span></span>' +
+            '<span ' + l10n + ' class="name">' + this.h('name') + '</span>' +
           '</label>' +
         '</li>';
     }

@@ -1,8 +1,10 @@
+/* globals LazyLoader, LiveConnector, GmailConnector, FacebookConnector,
+  utils, importer, contacts*/
 'use strict';
 
 (function(document) {
   var serviceName = getServiceName();
-  var allowedOrigin = oauthflow.params[serviceName].appOrigin;
+  var allowedOrigin = location.origin;
 
   function parseParams(paramsStr) {
     var out = {};
@@ -39,9 +41,11 @@
     },
     'facebook': function(cb) {
       var files = [
-                   '/contacts/js/fb/fb_utils.js',
-                   '/contacts/js/fb/fb_contact_utils.js',
+                   '/shared/js/fb/fb_request.js',
                    '/contacts/js/fb/fb_data.js',
+                   '/contacts/js/fb/fb_utils.js',
+                   '/shared/js/fb/fb_reader_utils.js',
+                   '/contacts/js/fb/fb_contact_utils.js',
                    '/contacts/js/fb/fb_query.js',
                    '/contacts/js/fb/fb_contact.js',
                    '/facebook/js/facebook_connector.js',
@@ -61,15 +65,6 @@
     else {
       throw new Error('Service Connector not found !!!');
     }
-  }
-
-  function cancelCb() {
-    Curtain.hide();
-
-    parent.postMessage({
-      type: 'abort',
-      data: ''
-    }, allowedOrigin);
   }
 
   function tokenReady(access_token) {

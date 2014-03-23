@@ -98,12 +98,23 @@ document.addEventListener('DOMContentLoaded', function onload() {
     return found.length ? found[0] : null;
   }
 
+  function padLeft(num, length) {
+    var r = String(num);
+    while (r.length < length) {
+      r = '0' + r;
+    }
+    return r;
+  }
+
   function mergeDBs() {
     var apn = {};
 
     for (var mcc = 1; mcc < 999; mcc++) {
       var country = {};
-      var result = queryAndroidDB(mcc);
+
+      var _mcc = padLeft(mcc, 3);
+
+      var result = queryAndroidDB(_mcc);
 
      if (result && result.length) {
         result.sort();
@@ -111,14 +122,14 @@ document.addEventListener('DOMContentLoaded', function onload() {
           var mnc = result[i].mnc;
 
           var operatorVariantSettings = {};
-          var voicemail = queryGnomeDB(mcc, mnc, 'voicemail');
+          var voicemail = queryGnomeDB(_mcc, mnc, 'voicemail');
           if (voicemail) {
             operatorVariantSettings.voicemail = voicemail;
             if (DEBUG) {
               console.log(operatorVariantSettings.voicemail + ': ' + voicemail);
             }
           }
-          var otherSettings = queryOperatorVariantDB(mcc, mnc);
+          var otherSettings = queryOperatorVariantDB(_mcc, mnc);
           if (otherSettings) {
             if (DEBUG) {
               console.log('Other operator settings: ' +
@@ -130,6 +141,7 @@ document.addEventListener('DOMContentLoaded', function onload() {
                 operatorVariantSettings.voicemail = voicemail;
               }
             }
+
             var enableStrict7BitEncodingForSms =
               otherSettings['enableStrict7BitEncodingForSms'];
             if (enableStrict7BitEncodingForSms) {
@@ -141,6 +153,13 @@ document.addEventListener('DOMContentLoaded', function onload() {
             if (cellBroadcastSearchList) {
               operatorVariantSettings.cellBroadcastSearchList =
                 cellBroadcastSearchList;
+            }
+
+            var operatorSizeLimitation =
+              otherSettings['operatorSizeLimitation'];
+            if (operatorSizeLimitation) {
+              operatorVariantSettings.operatorSizeLimitation =
+                +operatorSizeLimitation;
             }
             var skipProxy = otherSettings['skipProxy'];
             if (skipProxy == 'true') {
@@ -161,7 +180,7 @@ document.addEventListener('DOMContentLoaded', function onload() {
           if (country[mnc]) {
             if (DEBUG) { // warn about the duplicate (mcc, mnc) tuple
               if (country[mnc].length == 1) {
-                console.log('duplicate mcc/mnc: ' + mcc + '/' + mnc);
+                console.log('duplicate mcc/mnc: ' + _mcc + '/' + mnc);
                 console.log(' - ' + country[mnc][0].carrier);
               }
               console.log(' - ' + result[i].carrier);
@@ -169,14 +188,14 @@ document.addEventListener('DOMContentLoaded', function onload() {
             country[mnc].push(result[i]);
           } else {
             country[mnc] = [result[i]];
-            if (voicemail || otherSettings || cellBroadcastSearchList) {
+            if (voicemail || otherSettings) {
               operatorVariantSettings.type = [];
               operatorVariantSettings.type.push('operatorvariant');
               country[mnc].push(operatorVariantSettings);
             }
           }
         }
-        apn[mcc] = country;
+        apn[_mcc] = country;
       }
     }
 
@@ -196,7 +215,8 @@ document.addEventListener('DOMContentLoaded', function onload() {
       'ril.data.user': 'user',
       'ril.data.passwd': 'password',
       'ril.data.httpProxyHost': 'proxy',
-      'ril.data.httpProxyPort': 'port'
+      'ril.data.httpProxyPort': 'port',
+      'ril.data.authtype': 'authtype'
     },
     'supl': {
       'ril.supl.carrier': 'carrier',
@@ -204,7 +224,8 @@ document.addEventListener('DOMContentLoaded', function onload() {
       'ril.supl.user': 'user',
       'ril.supl.passwd': 'password',
       'ril.supl.httpProxyHost': 'proxy',
-      'ril.supl.httpProxyPort': 'port'
+      'ril.supl.httpProxyPort': 'port',
+      'ril.supl.authtype': 'authtype'
     },
     'mms': {
       'ril.mms.carrier': 'carrier',
@@ -215,12 +236,32 @@ document.addEventListener('DOMContentLoaded', function onload() {
       'ril.mms.httpProxyPort': 'port',
       'ril.mms.mmsc': 'mmsc',
       'ril.mms.mmsproxy': 'mmsproxy',
-      'ril.mms.mmsport': 'mmsport'
+      'ril.mms.mmsport': 'mmsport',
+      'ril.mms.authtype': 'authtype'
+    },
+    'dun': {
+      'ril.dun.carrier': 'carrier',
+      'ril.dun.apn': 'apn',
+      'ril.dun.user': 'user',
+      'ril.dun.passwd': 'password',
+      'ril.dun.httpProxyHost': 'proxy',
+      'ril.dun.httpProxyPort': 'port',
+      'ril.dun.authtype': 'authtype'
+    },
+    'ims': {
+      'ril.ims.carrier': 'carrier',
+      'ril.ims.apn': 'apn',
+      'ril.ims.user': 'user',
+      'ril.ims.passwd': 'password',
+      'ril.ims.httpProxyHost': 'proxy',
+      'ril.ims.httpProxyPort': 'port',
+      'ril.ims.authtype': 'authtype'
     },
     'operatorvariant': {
       'ril.iccInfo.mbdn': 'voicemail',
       'ril.sms.strict7BitEncoding.enabled': 'enableStrict7BitEncodingForSms',
-      'ril.cellbroadcast.searchlist': 'cellBroadcastSearchList'
+      'ril.cellbroadcast.searchlist': 'cellBroadcastSearchList',
+      'dom.mms.operatorSizeLimitation': 'operatorSizeLimitation'
     }
   };
 

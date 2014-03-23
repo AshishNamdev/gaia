@@ -1,3 +1,5 @@
+/* global KeyboardHelper */
+/* exported LanguageManager */
 'use strict';
 
 var LanguageManager = {
@@ -5,44 +7,20 @@ var LanguageManager = {
 
   init: function init() {
     this.getCurrentLanguage(this.buildLanguageList.bind(this));
-    this.getCurrentKeyboardLayout();
-    this.getSupportedKbLayouts();
     document.getElementById('languages').addEventListener('change', this);
     this.settings.addObserver('language.current',
-        this.changeDefaultKb.bind(this));
+      function updateDefaultLayouts(event) {
+        // the 2nd parameter is to reset the current enabled layouts
+        KeyboardHelper.changeDefaultLayouts(event.settingValue, true);
+      });
   },
 
   handleEvent: function handleEvent(evt) {
-    if (!this.settings || evt.target.name != 'language.current')
+    if (!this.settings || evt.target.name != 'language.current') {
       return true;
+    }
     this.settings.createLock().set({'language.current': evt.target.value});
     return false;
-  },
-
-  changeDefaultKb: function changeDefaultKb(event) {
-    if (this._kbLayoutList) {
-      var lock = this.settings.createLock();
-      // Disable all other keyboard layouts to switch to the new one
-      if (this._languages) {
-        for (var lang in this._languages)
-          if (lang != event.settingValue) {
-            var oldKB = this._kbLayoutList[lang];
-            var settingOldKB = {};
-            settingOldKB['keyboard.layouts.' + oldKB] = false;
-            lock.set(settingOldKB);
-          }
-      }
-
-      var newKB = this._kbLayoutList[event.settingValue];
-      var settingNewKB = {};
-      settingNewKB['keyboard.layouts.' + newKB] = true;
-
-      lock.set(settingNewKB);
-      lock.set({'keyboard.current': event.settingValue});
-      console.log('Keyboard layout changed to ' + event.settingValue);
-
-      this._currentLanguage = event.settingValue;
-    }
   },
 
   getCurrentLanguage: function settings_getCurrent(callback) {
@@ -53,19 +31,11 @@ var LanguageManager = {
     });
   },
 
-  getCurrentKeyboardLayout: function settings_getCurrentKb() {
-    var self = this;
-    this.readSetting('keyboard.current', function onResponse(setting) {
-      if (setting) {
-        self._currentKbLayout = setting;
-      }
-    });
-  },
-
   readSetting: function settings_readSetting(name, callback) {
     var settings = window.navigator.mozSettings;
-    if (!settings || !settings.createLock || !callback)
+    if (!settings || !settings.createLock || !callback) {
       return;
+    }
 
     var req = settings.createLock().get(name);
 
@@ -79,8 +49,9 @@ var LanguageManager = {
   },
 
   getSupportedLanguages: function settings_getSupportedLanguages(callback) {
-    if (!callback)
+    if (!callback) {
       return;
+    }
 
     if (this._languages) {
       callback(this._languages);
@@ -96,27 +67,11 @@ var LanguageManager = {
     }
   },
 
-  getSupportedKbLayouts: function settings_getSupportedKbLayouts(callback) {
-    if (this._kbLayoutList) {
-      if (callback)
-        callback(this._kbLayoutList);
-    } else {
-      var KEYBOARDS = 'keyboard_layouts.json';
-      var self = this;
-      this.readSharedFile(KEYBOARDS, function getKeyboardLayouts(data) {
-        if (data) {
-          self._kbLayoutList = data;
-          if (callback)
-            callback(self._kbLayoutList);
-        }
-      });
-    }
-  },
-
   readSharedFile: function settings_readSharedFile(file, callback) {
     var URI = '/shared/resources/' + file;
-    if (!callback)
+    if (!callback) {
       return;
+    }
 
     var xhr = new XMLHttpRequest();
     xhr.onreadystatechange = function loadFile() {
@@ -161,6 +116,7 @@ var LanguageManager = {
         p.appendChild(bdo);
 
         var label = document.createElement('label');
+        label.classList.add('pack-radio');
         label.appendChild(input);
         label.appendChild(span);
         label.appendChild(p);

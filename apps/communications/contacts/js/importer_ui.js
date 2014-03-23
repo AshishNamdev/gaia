@@ -1,3 +1,6 @@
+/* globals LazyLoader, ConfirmDialog, utils, contacts, oauthflow,
+  Curtain, ImageLoader, importer, asyncStorage, FriendListRenderer,
+  Rest, oauth2, contactsList*/
 'use strict';
 
 if (typeof window.importer === 'undefined') {
@@ -45,6 +48,8 @@ if (typeof window.importer === 'undefined') {
     // Current network request to enable canceling
     var currentNetworkRequest = null;
 
+    var cancelled = false;
+
     var _ = navigator.mozL10n.get;
 
     // Indicates whether some friends have been imported or not
@@ -71,33 +76,48 @@ if (typeof window.importer === 'undefined') {
 
     var isOnLine = navigator.onLine;
     var ongoingImport = false;
-    var theImporter;
+    var ongoingClean = false;
+    var theImporter, theCleaner;
 
     window.addEventListener('online', onLineChanged);
     window.addEventListener('offline', onLineChanged);
 
+    function notifyParent(message, origin) {
+      parent.postMessage({
+        type: message.type || '',
+        data: message.data || '',
+        message: message.message || ''
+      }, origin);
+    }
+
     function showOfflineDialog(yesCb, noCb) {
       var recommend = serviceConnector.name === 'facebook';
-      ConfirmDialog.show(_('connectionLost'), _('connectionLostMsg'),
-        {
-          title: _('noOption'),
-          isRecommend: !recommend,
-          callback: function() {
-            ConfirmDialog.hide();
-            noCb();
-          }
-        },
-        {
-          title: _('yesOption'),
-          // FB friends can later resync data
-          isRecommend: recommend,
-          callback: function() {
-            ConfirmDialog.hide();
-            yesCb();
-          }
-      }, {
-        zIndex: '10000'
-    });
+      var dialog = parent.document.getElementById('confirmation-message');
+      parent.LazyLoader.load(dialog, function() {
+        navigator.mozL10n.translate(dialog);
+        LazyLoader.load('/contacts/js/utilities/confirm.js', function() {
+          ConfirmDialog.show(_('connectionLost'), _('connectionLostMsg'),
+          {
+            title: _('noOption'),
+            isRecommend: !recommend,
+            callback: function() {
+              ConfirmDialog.hide();
+              noCb();
+            }
+          },
+          {
+            title: _('yesOption'),
+            // FB friends can later resync data
+            isRecommend: recommend,
+            callback: function() {
+              ConfirmDialog.hide();
+              yesCb();
+            }
+          }, {
+            zIndex: '10000'
+          });
+        });
+      });
     }
 
     function onLineChanged() {
@@ -125,6 +145,45 @@ if (typeof window.importer === 'undefined') {
       return key;
     }
 
+    // Define a source adapter object to pass to contacts.Search.
+    //
+    // Since multiple, separate apps use contacts.Search its important for
+    // the search code to function independently.  This adapter object allows
+    // the search module to access the app's contacts without knowing anything
+    // about our DOM structure.
+    var searchSource = {
+      getNodes: function() {
+        return contactList.querySelectorAll('section > ol > li');
+      },
+      getFirstNode: function() {
+        return contactList.querySelector('section > ol > li');
+      },
+      getNextNode: function(contact) {
+        var out = contact.nextElementSibling;
+        var nextParent = contact.parentNode.parentNode.nextElementSibling;
+        while (!out && nextParent) {
+          out = nextParent.querySelector('ol > li:first-child');
+          nextParent = nextParent.nextElementSibling;
+        }
+        return out;
+      },
+      expectMoreNodes: function() {
+        // This app does not lazy load contacts into search via the
+        // appendNodes() function, so always return false.
+        return false;
+      },
+      clone: function(node) {
+        return node.cloneNode(true);
+      },
+      getNodeById: function(id) {
+        return contactsList.querySelector('[data-uuid="' + id + '"]');
+      },
+      getSearchText: function(node) {
+        return node.dataset.search;
+      },
+      click: onSearchResultCb
+    }; // searchSource
+
     UI.init = function() {
       var overlay = document.querySelector('nav[data-type="scrollbar"] p');
       var jumper = document.querySelector('nav[data-type="scrollbar"] ol');
@@ -146,8 +205,7 @@ if (typeof window.importer === 'undefined') {
       };
 
       utils.alphaScroll.init(params);
-      contacts.Search.init(document.getElementById('content'), null,
-                           onSearchResultCb, true);
+      contacts.Search.init(searchSource, true);
     };
 
     function notifyLogout() {
@@ -160,12 +218,9 @@ if (typeof window.importer === 'undefined') {
     }
 
     UI.end = function(event) {
-      var msg = {
-        type: 'window_close',
-        data: ''
-      };
-
-      parent.postMessage(msg, targetApp);
+      notifyParent({
+        type: 'window_close'
+      }, targetApp);
       // uncomment this to make it work on B2G-Desktop
       // parent.postMessage(msg, '*');
 
@@ -200,7 +255,7 @@ if (typeof window.importer === 'undefined') {
             markPendingLogout(logoutUrl, serviceName, cb);
           },
           timeout: function() {
-            window.console.warn('Timeout while logging out user ', url);
+            window.console.warn('Timeout while logging out user ', logoutUrl);
             removeToken();
             markPendingLogout(logoutUrl, serviceName, cb);
           },
@@ -269,7 +324,7 @@ if (typeof window.importer === 'undefined') {
       friendsImported = false;
       syncOngoing = false;
 
-      ongoingImport = false;
+      ongoingImport = ongoingClean = false;
 
       selectAllButton = document.getElementById('select-all');
       deSelectAllButton = document.getElementById('deselect-all');
@@ -359,11 +414,8 @@ if (typeof window.importer === 'undefined') {
      *
      */
     function friendsAvailable() {
-      FixedHeader.init('#mainContent', '#fixed-container',
-                     '.import-list header, .fb-import-list header');
-
       imgLoader = new ImageLoader('#mainContent',
-                                ".block-item:not([data-uuid='#uid#'])");
+                                '.block-item:not([data-uuid="#uid#"])');
 
       var s = '.block-item:not([data-uuid="#uid#"]) input[type="checkbox"]';
       checkNodeList = contactList.querySelectorAll(s);
@@ -471,17 +523,6 @@ if (typeof window.importer === 'undefined') {
 
     };
 
-    function friendImportTimeout() {
-      if (currentRequest) {
-        window.setTimeout(currentRequest.ontimeout, 0);
-      }
-    }
-
-    function friendImportError(e) {
-      currentRequest.failed(e);
-    }
-
-
     /**
      *  Callback invoked when friends are ready to be used
      *
@@ -527,45 +568,50 @@ if (typeof window.importer === 'undefined') {
         else {
           // There was a problem with the access token
           window.console.warn('Access Token expired or revoked');
-          Curtain.hide();
+          Curtain.hide(notifyParent.bind(null, {
+            type: 'token_error'
+          }, targetApp));
           window.asyncStorage.removeItem(tokenKey,
             function token_removed() {
               oauth2.getAccessToken(function(new_acc_tk) {
                 access_token = new_acc_tk;
                 Importer.getFriends(new_acc_tk);
               }, 'friends', serviceConnector.name);
-              parent.postMessage({
-                type: 'token_error',
-                data: ''
-              },targetApp);
           });
         } // else
       } // else
     };
+
+    function cancelImport() {
+      cancelled = true;
+
+      var cancelFunc = onUpdate;
+      if (ongoingImport) {
+        cancelFunc = theImporter.finish;
+      } else if (ongoingClean) {
+        cancelFunc = theCleaner.finish;
+      }
+
+      cancelFunc();
+      Curtain.show('message', 'canceling');
+    }
 
     function cancelCb() {
       if (currentNetworkRequest) {
          currentNetworkRequest.cancel();
          currentNetworkRequest = null;
       }
-
-      Curtain.hide();
-
-      parent.postMessage({
-            type: 'abort',
-            data: ''
-      }, targetApp);
+      Curtain.hide(notifyParent.bind(null, {
+        type: 'abort'
+      }, targetApp));
     }
 
     function setCurtainHandlersErrorFriends() {
       Curtain.oncancel = function friends_cancel() {
-          Curtain.hide();
-
-          parent.postMessage({
-            type: 'abort',
-            data: ''
-          }, targetApp);
-        };
+        Curtain.hide(notifyParent.bind(null, {
+          type: 'abort'
+        }, targetApp));
+      };
 
       Curtain.onretry = function get_friends() {
         Curtain.oncancel = cancelCb;
@@ -636,39 +682,33 @@ if (typeof window.importer === 'undefined') {
      *  finished
      */
     function onUpdate(numFriends) {
-      function notifyParent(numFriends) {
-        parent.postMessage({
-          type: 'window_close',
-          data: '',
-          message: _('friendsUpdated', {
-            numFriends: numFriends
-          })
-        }, targetApp);
-      }
-
       // If the service requires to do the logout it is done
       serviceLogout(notifyLogout);
 
       if (Importer.getContext() === 'ftu') {
-        Curtain.hide(function onhide() {
-          notifyParent(numFriends);
-        });
+        Curtain.hide(notifyParent.bind(null, {
+          type: 'window_close',
+          message: cancelled ? null : _('friendsUpdated', {
+            numFriends: numFriends
+          })
+        }, targetApp));
       } else {
-        parent.postMessage({
-          type: 'import_updated',
-          data: ''
+        notifyParent({
+          type: 'import_updated'
         }, targetApp);
-
         window.addEventListener('message', function finished(e) {
           if (e.origin !== targetApp) {
             return;
           }
           if (e.data.type === 'contacts_loaded') {
             // When the list of contacts is loaded and it's the current view
-            Curtain.hide(function onhide() {
-              // Please close me and display the number of friends updated
-              notifyParent(numFriends);
-            });
+            Curtain.hide(notifyParent.bind(null, {
+              type: 'window_close',
+              message: cancelled ? null :
+              _('friendsUpdated', {
+                numFriends: numFriends
+              })
+            }, targetApp));
             window.removeEventListener('message', finished);
           }
         });
@@ -676,9 +716,12 @@ if (typeof window.importer === 'undefined') {
     }
 
     function cleanContacts(onsuccess, progress) {
+      if (cancelled) {
+        return;
+      }
+
       var contacts = [];
       var unSelectedKeys = Object.keys(unSelectedContacts);
-      // ContactsCleaner expects an Array object
       unSelectedKeys.forEach(function iterator(uid) {
         var deviceContacts = unSelectedContacts[uid];
         for (var i = 0; i < deviceContacts.length; i++) {
@@ -688,15 +731,23 @@ if (typeof window.importer === 'undefined') {
 
       // To optimize if the user wishes to unselect all
       var mode = 'update';
-      if (unSelectedKeys.length === existingContacts.length) {
+      if (unSelectedKeys.length === existingContacts.length &&
+          Object.keys(selectedContacts).length === 0) {
         mode = 'clear';
+        Curtain.hideMenu(); // User cannot cancel cleaning all the friends
       }
 
       serviceConnector.cleanContacts(contacts, mode,
           function gotCleaner(cleaner) {
             if (cleaner) {
+              theCleaner = cleaner;
+              ongoingClean = true;
               cleaner.oncleaned = progress.update;
-              cleaner.onsuccess = onsuccess;
+              cleaner.onsuccess = function() {
+                ongoingClean = false;
+                theCleaner = null;
+                onsuccess();
+              };
             }
             else {
               Importer.errorHandler();
@@ -719,14 +770,18 @@ if (typeof window.importer === 'undefined') {
      *
      */
     UI.importAll = function(e) {
+      imgLoader.unload(); // Removing listeners
       var selected = Object.keys(selectedContacts).length;
       var unSelected = getTotalUnselected();
       var total = selected + unSelected;
 
+      cancelled = false;
+      var progress;
       if (selected > 0) {
-        var progress = Curtain.show('progress', 'import');
+        progress = Curtain.show('progress', 'import');
         progress.setTotal(total);
 
+        Curtain.oncancel = cancelImport;
         Importer.importAll(function on_all_imported(totalImported) {
           if (typeof serviceConnector.oncontactsimported === 'function') {
             // Check whether we need to set the last update and schedule next
@@ -737,20 +792,21 @@ if (typeof window.importer === 'undefined') {
               friendsImported = true;
             });
           }
-          if (unSelected > 0) {
+          if (!cancelled && unSelected > 0) {
             progress.setFrom('update');
             cleanContacts(function callback() {
-              onUpdate(totalImported + unSelected);
+              onUpdate(progress.getValue());
             }, progress);
           } else {
-            onUpdate(totalImported);
+            onUpdate(progress.getValue());
           }
         }, progress);
       } else if (unSelected > 0) {
-        var progress = Curtain.show('progress', 'update');
+        progress = Curtain.show('progress', 'update');
         progress.setTotal(total);
+        Curtain.oncancel = cancelImport;
         cleanContacts(function callback() {
-          onUpdate(total);
+          onUpdate(progress.getValue());
         }, progress);
       }
     };
@@ -802,17 +858,6 @@ if (typeof window.importer === 'undefined') {
 
       return false;
     };
-
-    /**
-     *   Clears the list of contacts
-     *
-     */
-    function clearList() {
-      var template = contactList.querySelector('[data-template]');
-
-      utils.dom.removeChildNodes(contactList);
-      contactList.appendChild(template);
-    }
 
     /**
      *  Makes a bulk selection of the contacts
@@ -904,9 +949,11 @@ if (typeof window.importer === 'undefined') {
     }
 
     function doImportAll(importedCB, progress) {
+      if (cancelled) {
+        return;
+      }
+
       checkNodeList = null;
-      var toBeImported = Object.keys(selectedContacts);
-      var numFriends = toBeImported.length;
 
       theImporter = serviceConnector.getImporter(selectedContacts,
                                                    access_token);
@@ -920,6 +967,7 @@ if (typeof window.importer === 'undefined') {
       theImporter.onsuccess = function(totalImported) {
         ongoingImport = false;
         window.setTimeout(function imported() {
+          window.importUtils.setTimestamp(serviceConnector.name);
           importedCB(totalImported);
         }, 0);
 
@@ -954,8 +1002,7 @@ if (typeof window.importer === 'undefined') {
         showOfflineDialog(function() {
           doImportAll(importedCB, progress);
         }, function() {
-          Curtain.hide();
-          UI.end();
+          Curtain.hide(UI.end);
         });
       }
     };

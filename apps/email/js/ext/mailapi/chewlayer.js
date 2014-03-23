@@ -2146,7 +2146,7 @@ HTMLSanitizer.prototype = {
         this.complete = true;
       }
     } else {
-      this.output += escapeHTMLEntities(text);
+      this.output += escapeHTMLTextKeepingExistingEntities(text);
     }
   },
 
@@ -2193,37 +2193,33 @@ var HTMLParser = (function(){
   //
   // The spec defines attributes by what they must not include, which is:
   // [\0\s"'>/=] plus also no control characters, or non-unicode characters.
-  // But we currently use the same regexp as we use for tags because that's what
-  // the code was using already.
+  //
+  // The (inherited) code used to have the regular expression effectively
+  // validate the attribute syntax by including their grammer in the regexp.
+  // The problem with this is that it can make the regexp fail to match tags
+  // that are clearly tags.  When we encountered (quoted) attributes without
+  // whitespace between them, we would escape the entire tag.  Attempted
+  // trivial fixes resulted in regex back-tracking, which begged the issue of
+  // why the regex would do this in the first place.  So we stopped doing that.
   //
   // CDATA *is not a thing* in the HTML namespace.  <![CDATA[ just gets treated
   // as a "bogus comment".  See:
   // http://www.whatwg.org/specs/web-apps/current-work/multipage/tokenization.html#markup-declaration-open-state
 
-  // NOTE: tag and attr regexps changed to ignore name spaces prefixes!  via
+  // NOTE: tag and attr regexps changed to ignore name spaces prefixes!
+  //
+  // CHANGE: "we" previously required there to be white-space between attributes.
+  // Unfortunately, the world does not agree with this, so we now require
+  // whitespace only after the tag name prior to the first attribute and make
+  // the whole attribute clause optional.
+  //
   // - Regular Expressions for parsing tags and attributes
   // ^<                     anchored tag open character
   // (?:[-A-Za-z0-9_]+:)?   eat the namespace
   // ([-A-Za-z0-9_]+)       the tag name
-  // (                      repeated attributes:
-  //  (?:
-  //   \s+                  Mandatory whitespace between attribute names
-  //   (?:[-A-Za-z0-9_]+:)? optional attribute prefix
-  //   [-A-Za-z0-9_]+       attribute name
-  //   (?:                  The attribute doesn't need a value
-  //    \s*=\s*             whitespace, = to indicate value, whitespace
-  //    (?:                 attribute values:
-  //     (?:"[^"]*")|       double-quoted
-  //     (?:'[^']*')|       single-quoted
-  //     [^>\s]+            unquoted
-  //    )
-  //   )?                   (the attribute does't need a value)
-  //  )*                    (there can be multiple attributes)
-  // )                      (capture the list of attributes)
-  // \s*                    optional whitespace before the tag closer
-  // (\/?)                  optional self-closing character
+  // ([^>]*)                capture attributes and/or closing '/' if present
   // >                      tag close character
-  var startTag = /^<(?:[-A-Za-z0-9_]+:)?([-A-Za-z0-9_]+)((?:\s+(?:[-A-Za-z0-9_]+:)?[-A-Za-z0-9_]+(?:\s*=\s*(?:(?:"[^"]*")|(?:'[^']*')|[^>\s]+))?)*)\s*(\/?)>/,
+  var startTag = /^<(?:[-A-Za-z0-9_]+:)?([-A-Za-z0-9_]+)([^>]*)>/,
   // ^<\/                   close tag lead-in
   // (?:[-A-Za-z0-9_]+:)?   optional tag prefix
   // ([-A-Za-z0-9_]+)       tag name
@@ -2379,7 +2375,7 @@ var HTMLParser = (function(){
     // Clean up any remaining tags
     parseEndTag();
 
-    function parseStartTag( tag, tagName, rest, unary ) {
+    function parseStartTag( tag, tagName, rest ) {
       tagName = tagName.toLowerCase();
       if ( block[ tagName ] ) {
         while ( stack.last() && inline[ stack.last() ] ) {
@@ -2391,7 +2387,13 @@ var HTMLParser = (function(){
         parseEndTag( "", tagName );
       }
 
-      unary = empty[ tagName ] || !!unary;
+      var unary = empty[ tagName ];
+      // to simplify the regexp, the 'rest capture group now absorbs the /, so
+      // we need to strip it off if it's there.
+      if (rest.length && rest[rest.length - 1] === '/') {
+        unary = true;
+        rest = rest.slice(0, -1);
+      }
 
       if ( !unary )
         stack.push( tagName );
@@ -2429,10 +2431,12 @@ var HTMLParser = (function(){
         var pos = 0;
 
       // Find the closest opened tag of the same type
-      else
+      else {
+        tagName = tagName.toLowerCase();
         for ( var pos = stack.length - 1; pos >= 0; pos-- )
           if ( stack[ pos ] == tagName )
             break;
+      }
 
       if ( pos >= 0 ) {
         // Close all the open elements, up the stack
@@ -2796,7 +2800,11 @@ function makeReverseEntities () {
   });
 }
 
-function escapeHTMLEntities(text) {
+/**
+ * Escapes HTML characters like [<>"'&] in the text,
+ * leaving existing HTML entities intact.
+ */
+function escapeHTMLTextKeepingExistingEntities(text) {
   return text.replace(/[<>"']|&(?![#a-zA-Z0-9]+;)/g, function(c) {
     return '&#' + c.charCodeAt(0) + ';';
   });
@@ -2826,6 +2834,30 @@ exports.unescapeHTMLEntities = function unescapeHTMLEntities(text) {
     return converted;
   });
 };
+
+/**
+ * Renders text content safe for injecting into HTML by
+ * replacing all characters which could be used to create HTML elements.
+ */
+exports.escapePlaintextIntoElementContext = function (text) {
+  return text.replace(/[&<>"'\/]/g, function(c) {
+    var code = c.charCodeAt(0);
+    return '&' + (entities[code] || '#' + code) + ';';
+  });
+}
+
+/**
+ * Escapes all characters with ASCII values less than 256, other than
+ * alphanumeric characters, with the &#xHH; format to prevent
+ * switching out of the attribute.
+ */
+exports.escapePlaintextIntoAttribute = function (text) {
+  return text.replace(/[\u0000-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u0100]/g, function(c) {
+    var code = c.charCodeAt(0);
+    return '&' + (entities[code] || '#' + code) + ';';
+  });
+}
+
 
 }); // end define
 ;
@@ -3374,18 +3406,21 @@ exports.generateSnippet = function generateSnippet(htmlString) {
  */
 exports.wrapTextIntoSafeHTMLString = function(text, wrapTag,
                                               transformNewlines, attrs) {
-  if (transformNewlines === undefined)
+  if (transformNewlines === undefined) {
     transformNewlines = true;
+  }
 
   wrapTag = wrapTag || 'div';
 
+  text = $bleach.escapePlaintextIntoElementContext(text);
   text = transformNewlines ? text.replace(/\n/g, '<br/>') : text;
 
   var attributes = '';
   if (attrs) {
     var len = attrs.length;
     for (var i = 0; i < len; i += 2) {
-      attributes += ' ' + attrs[i] + '="' + attrs[i + 1] +'"';
+      attributes += ' ' + attrs[i] + '="' +
+        $bleach.escapePlaintextIntoAttribute(attrs[i + 1]) + '"';
     }
   }
 
@@ -3435,7 +3470,7 @@ define('mailapi/mailchew',
 
 var DESIRED_SNIPPET_LENGTH = 100;
 
-var RE_RE = /^[Rr][Ee]: /;
+var RE_RE = /^[Rr][Ee]:/;
 
 /**
  * Generate the reply subject for a message given the prior subject.  This is
@@ -3460,10 +3495,34 @@ var RE_RE = /^[Rr][Ee]: /;
  * http://mxr.mozilla.org/comm-central/ident?i=NS_MsgStripRE for more details.
  */
 exports.generateReplySubject = function generateReplySubject(origSubject) {
-  if (RE_RE.test(origSubject))
+  var re = 'Re: ';
+  if (origSubject) {
+    if (RE_RE.test(origSubject))
       return origSubject;
-  return 'Re: ' + origSubject;
+
+    return re + origSubject;
+  }
+  return re;
 };
+
+var FWD_FWD = /^[Ff][Ww][Dd]:/;
+
+/**
+ * Generate the foward subject for a message given the prior subject.  This is
+ * simply prepending "Fwd: " to the message if it does not already have an
+ * "Fwd:" equivalent.
+ */
+exports.generateForwardSubject = function generateForwardSubject(origSubject) {
+  var fwd = 'Fwd: ';
+  if (origSubject) {
+    if (FWD_FWD.test(origSubject))
+      return origSubject;
+
+    return fwd + origSubject;
+  }
+  return fwd;
+};
+
 
 var l10n_wroteString = '{name} wrote',
     l10n_originalMessageString = 'Original Message';
@@ -3487,7 +3546,7 @@ var l10n_forward_header_labels = {
   from: 'From',
   replyTo: 'Reply-To',
   to: 'To',
-  cc: 'CC',
+  cc: 'CC'
 };
 
 exports.setLocalizedStrings = function(strings) {
@@ -3502,7 +3561,7 @@ exports.setLocalizedStrings = function(strings) {
 if ($mailchewStrings.strings) {
   exports.setLocalizedStrings($mailchewStrings.strings);
 }
-$mailchewStrings.events.on('strings', function (strings) {
+$mailchewStrings.events.on('strings', function(strings) {
   exports.setLocalizedStrings(strings);
 });
 
@@ -3516,7 +3575,7 @@ $mailchewStrings.events.on('strings', function (strings) {
 exports.generateReplyBody = function generateReplyMessage(reps, authorPair,
                                                           msgDate,
                                                           identity, refGuid) {
-  var useName = authorPair.name || authorPair.address;
+  var useName = authorPair.name ? authorPair.name.trim() : authorPair.address;
 
   var textMsg = '\n\n' +
                 l10n_wroteString.replace('{name}', useName) + ':\n',
@@ -3536,7 +3595,7 @@ exports.generateReplyBody = function generateReplyMessage(reps, authorPair,
         textMsg += replyText;
       }
     }
-    else {
+    else if (repType === 'html') {
       if (!htmlMsg) {
         htmlMsg = '';
         // slice off the trailing newline of textMsg
@@ -3545,11 +3604,13 @@ exports.generateReplyBody = function generateReplyMessage(reps, authorPair,
       // rep has already been sanitized and therefore all HTML tags are balanced
       // and so there should be no rude surprises from this simplistic looking
       // HTML creation.  The message-id of the message never got sanitized,
-      // however, so it needs to be escaped.
-      htmlMsg += '<blockquote cite="mid:' + $htmlchew.escapeAttrValue(refGuid) +
-                 '" type="cite">' +
-                 rep +
-                 '</blockquote>';
+      // however, so it needs to be escaped.  Also, in some cases (Activesync),
+      // we won't have the message-id so we can't cite it.
+      htmlMsg += '<blockquote ';
+      if (refGuid) {
+        htmlMsg += 'cite="mid:' + $htmlchew.escapeAttrValue(refGuid) + '" ';
+      }
+      htmlMsg += 'type="cite">' + rep + '</blockquote>';
     }
   }
 
@@ -3576,9 +3637,8 @@ exports.generateReplyBody = function generateReplyMessage(reps, authorPair,
  * Generate the body of an inline forward message.  XXX we need to generate
  * the header summary which needs some localized strings.
  */
-exports.generateForwardMessage = 
+exports.generateForwardMessage =
   function(author, date, subject, headerInfo, bodyInfo, identity) {
-
   var textMsg = '\n\n', htmlMsg = null;
 
   if (identity.signature)
@@ -3641,7 +3701,7 @@ exports.generateForwardMessage =
         textMsg += forwardText;
       }
     }
-    else {
+    else if (repType === 'html') {
       if (!htmlMsg)
         htmlMsg = '';
       htmlMsg += rep;
@@ -3733,11 +3793,13 @@ exports.processMessageContent = function processMessageContent(
 define('mailapi/imap/imapchew',
   [
     'mimelib',
+    'mailapi/db/mail_rep',
     '../mailchew',
     'exports'
   ],
   function(
     $mimelib,
+    mailRep,
     $mailchew,
     exports
   ) {
@@ -3897,7 +3959,7 @@ function chewStructure(msg) {
 
     function makePart(partInfo, filename) {
 
-      return {
+      return mailRep.makeAttachmentPart({
         name: filename || 'unnamed-' + (++unnamedPartCounter),
         contentId: partInfo.id ? stripArrows(partInfo.id) : null,
         type: (partInfo.type + '/' + partInfo.subtype).toLowerCase(),
@@ -3911,24 +3973,27 @@ function chewStructure(msg) {
         textFormat: (partInfo.params && partInfo.params.format &&
                      partInfo.params.format.toLowerCase()) || undefined
          */
-      };
+      });
     }
 
     function makeTextPart(partInfo) {
-      return {
+      return mailRep.makeBodyPart({
         type: partInfo.subtype,
         part: partInfo.partID,
         sizeEstimate: partInfo.size,
         amountDownloaded: 0,
         // its important to know that sizeEstimate and amountDownloaded
-        // do _not_ determine if the bodyRep is fully downloaded the
+        // do _not_ determine if the bodyRep is fully downloaded; the
         // estimated amount is not reliable
-        isDownloaded: false,
+        // Zero-byte bodies are assumed to be accurate and we treat the file
+        // as already downloaded.
+        isDownloaded: partInfo.size === 0,
         // full internal IMAP representation
         // it would also be entirely appropriate to move
         // the information on the bodyRep directly?
-        _partInfo: partInfo
-      };
+        _partInfo: partInfo.size ? partInfo : null,
+        content: ''
+      });
     }
 
     if (disposition === 'attachment') {
@@ -4028,7 +4093,7 @@ exports.chewHeaderAndBodyStructure =
   var parts = chewStructure(msg);
   var rep = {};
 
-  rep.header = {
+  rep.header = mailRep.makeHeaderInfo({
     // the FolderStorage issued id for this message (which differs from the
     // IMAP-server-issued UID so we can do speculative offline operations like
     // moves).
@@ -4059,17 +4124,17 @@ exports.chewHeaderAndBodyStructure =
 
     // we lazily fetch the snippet later on
     snippet: null
-  };
+  });
 
 
-  rep.bodyInfo = {
+  rep.bodyInfo = mailRep.makeBodyInfo({
     date: msg.date,
     size: 0,
     attachments: parts.attachments,
     relatedParts: parts.relatedParts,
     references: msg.msg.references,
     bodyReps: parts.bodyReps
-  };
+  });
 
   return rep;
 };
@@ -4097,7 +4162,7 @@ exports.chewHeaderAndBodyStructure =
  *    // what just happend?
  *    // 1. the body.bodyReps[n].content is now the value of content.
  *    //
- *    // 2. we update .downloadedAmount with the second argument
+ *    // 2. we update .amountDownloaded with the second argument
  *    //    (number of bytes downloaded).
  *    //
  *    // 3. if snippet has not bee set on the header we create the snippet
@@ -4105,7 +4170,6 @@ exports.chewHeaderAndBodyStructure =
  *
  */
 exports.updateMessageWithFetch = function(header, body, req, res, _LOG) {
-
   var bodyRep = body.bodyReps[req.bodyRepIndex];
 
   // check if the request was unbounded or we got back less bytes then we
@@ -4114,7 +4178,7 @@ exports.updateMessageWithFetch = function(header, body, req, res, _LOG) {
     bodyRep.isDownloaded = true;
 
     // clear private space for maintaining parser state.
-    delete bodyRep._partInfo;
+    bodyRep._partInfo = null;
   }
 
   if (!bodyRep.isDownloaded && res.buffer) {
@@ -4127,7 +4191,9 @@ exports.updateMessageWithFetch = function(header, body, req, res, _LOG) {
     res.text, bodyRep.type, bodyRep.isDownloaded, req.createSnippet, _LOG
   );
 
-  header.snippet = data.snippet;
+  if (req.createSnippet) {
+    header.snippet = data.snippet;
+  }
   if (bodyRep.isDownloaded)
     bodyRep.content = data.content;
 };
@@ -4167,6 +4233,29 @@ exports.canBodyRepFillSnippet = function(bodyRep) {
     bodyRep.type === 'html'
   );
 };
+
+
+/**
+ * Calculates and returns the correct estimate for the number of
+ * bytes to download before we can display the body. For IMAP, that
+ * includes the bodyReps and related parts. (POP3 is different.)
+ */
+exports.calculateBytesToDownloadForImapBodyDisplay = function(body) {
+  var bytesLeft = 0;
+  body.bodyReps.forEach(function(rep) {
+    if (!rep.isDownloaded) {
+      bytesLeft += rep.sizeEstimate - rep.amountDownloaded;
+    }
+  });
+  body.relatedParts.forEach(function(part) {
+    if (!part.file) {
+      bytesLeft += part.sizeEstimate;
+    }
+  });
+  return bytesLeft;
+}
+
+
 
 }); // end define
 ;

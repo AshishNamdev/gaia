@@ -38,6 +38,17 @@ if (typeof Contacts.extServices === 'undefined') {
       loadService('live');
     };
 
+    extServices.match = function(contactId) {
+      closeRequested = canClose = true;
+      extensionFrame.src = currentURI = 'matching_contacts.html?contactId=' +
+                                                                      contactId;
+    };
+
+    extServices.showDuplicateContacts = function() {
+      closeRequested = canClose = true;
+      extensionFrame.src = currentURI = 'matching_contacts.html';
+    };
+
     function loadService(serviceName) {
       closeRequested = false;
       canClose = false;
@@ -63,6 +74,7 @@ if (typeof Contacts.extServices === 'undefined') {
     function close(message) {
       extensionFrame.addEventListener('transitionend', function tclose() {
         extensionFrame.removeEventListener('transitionend', tclose);
+        extensionFrame.classList.add('hidden');
         if (canClose === true && canCloseLogout === true) {
           unload();
         }
@@ -70,12 +82,12 @@ if (typeof Contacts.extServices === 'undefined') {
           closeRequested = true;
         }
 
-        if (message) {
+        if (message && message.trim().length > 0) {
           Contacts.showStatus(message);
         }
       // Otherwise we do nothing as the sync process will finish sooner or later
       });
-      extensionFrame.className = 'closing';
+      extensionFrame.classList.remove('opening');
     }
 
     function openURL(url) {
@@ -231,7 +243,7 @@ if (typeof Contacts.extServices === 'undefined') {
         }
       };
 
-      ConfirmDialog.show(null, msg, noObject, yesObject);
+      Contacts.confirmDialog(null, msg, noObject, yesObject);
     }
 
     function doUnlink(cid) {
@@ -252,7 +264,7 @@ if (typeof Contacts.extServices === 'undefined') {
     }
 
     function notifySettings(evtype) {
-       // Notify observers that a change from FB could have happened
+      // Notify observers that a change from FB could have happened
       var eventType = evtype || 'fb_changed';
 
       var event = new CustomEvent(eventType, {
@@ -273,14 +285,17 @@ if (typeof Contacts.extServices === 'undefined') {
 
       switch (data.type) {
         case 'ready':
-          extensionFrame.className = 'opening';
-          extensionFrame.addEventListener('transitionend', function topen() {
-            extensionFrame.removeEventListener('transitionend', topen);
-            extensionFrame.contentWindow.postMessage({
-              type: 'dom_transition_end',
-              data: ''
-            }, fb.CONTACTS_APP_ORIGIN);
-          });
+          extensionFrame.classList.remove('hidden');
+          window.setTimeout(function displaying() {
+            extensionFrame.classList.add('opening');
+            extensionFrame.addEventListener('transitionend', function topen() {
+              extensionFrame.removeEventListener('transitionend', topen);
+              extensionFrame.contentWindow.postMessage({
+                type: 'dom_transition_end',
+                data: ''
+              }, fb.CONTACTS_APP_ORIGIN);
+            });
+          }, 0);
         break;
 
         case 'authenticated':
@@ -306,12 +321,10 @@ if (typeof Contacts.extServices === 'undefined') {
         break;
 
         case 'import_updated':
-          Contacts.navigation.home(function fb_finished() {
-            extensionFrame.contentWindow.postMessage({
+          extensionFrame.contentWindow.postMessage({
               type: 'contacts_loaded',
               data: ''
             }, fb.CONTACTS_APP_ORIGIN);
-          });
         break;
 
         case 'sync_finished':
@@ -346,6 +359,14 @@ if (typeof Contacts.extServices === 'undefined') {
             type: 'token',
             data: access_token
           }, fb.CONTACTS_APP_ORIGIN);
+
+        case 'show_duplicate_contacts':
+          extensionFrame.contentWindow.postMessage(data,
+                                                    fb.CONTACTS_APP_ORIGIN);
+
+        case 'duplicate_contacts_merged':
+          extensionFrame.contentWindow.postMessage(data,
+                                                    fb.CONTACTS_APP_ORIGIN);
         break;
       }
     }

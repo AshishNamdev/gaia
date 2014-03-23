@@ -1,66 +1,155 @@
-/*
-  Compose Tests
-*/
+/* global MocksHelper, MockAttachment, MockL10n, loadBodyHTML,
+         Compose, Attachment, MockMozActivity, Settings, Utils,
+         AttachmentMenu, Draft, document, XMLHttpRequest, Blob, navigator,
+         setTimeout, ThreadUI, SMIL */
+
+/*jshint strict:false */
+/*jslint node: true */
+
 'use strict';
 
-mocha.globals(['0']);
-
 requireApp('sms/js/compose.js');
-requireApp('sms/js/thread_ui.js');
 requireApp('sms/js/utils.js');
+requireApp('sms/js/drafts.js');
+// Storage automatically called on Drafts.add()
+require('/shared/js/async_storage.js');
 
 requireApp('sms/test/unit/mock_l10n.js');
 requireApp('sms/test/unit/mock_attachment.js');
+requireApp('sms/test/unit/mock_attachment_menu.js');
 requireApp('sms/test/unit/mock_recipients.js');
 requireApp('sms/test/unit/mock_settings.js');
 requireApp('sms/test/unit/mock_utils.js');
 requireApp('sms/test/unit/mock_moz_activity.js');
+requireApp('sms/test/unit/mock_thread_ui.js');
+require('/test/unit/mock_smil.js');
 
-var mocksHelper = new MocksHelper([
+var mocksHelperForCompose = new MocksHelper([
+  'AttachmentMenu',
   'Settings',
   'Recipients',
   'Utils',
   'MozActivity',
-  'Attachment'
+  'Attachment',
+  'ThreadUI',
+  'SMIL'
 ]).init();
 
 suite('compose_test.js', function() {
-  mocksHelper.attachTestHelpers();
+  mocksHelperForCompose.attachTestHelpers();
   var realMozL10n;
+  var oversizedImageBlob,
+      smallImageBlob;
 
   function mockAttachment(size) {
     var attachment = new MockAttachment({
-      type: 'image/jpeg',
+      type: 'audio/ogg',
       size: size || 12345
-    }, 'IMG_0554.jpg');
-    attachment.mNextRender = document.createElement('iframe');
-    attachment.mNextRender.className = 'attachment';
+    }, { name: 'audio.oga' });
     return attachment;
   }
 
-  suiteSetup(function() {
+  function mockImgAttachment(isOversized) {
+    var attachment = isOversized ?
+      new MockAttachment(oversizedImageBlob, { name: 'oversized.jpg' }) :
+      new MockAttachment(smallImageBlob, { name: 'small.jpg' });
+    return attachment;
+  }
+
+  suiteSetup(function(done) {
     realMozL10n = navigator.mozL10n;
     navigator.mozL10n = MockL10n;
+    // Create test blob for image attachment resize testing
+    var assetsNeeded = 0;
+    function getAsset(filename, loadCallback) {
+      assetsNeeded++;
+
+      var req = new XMLHttpRequest();
+      req.open('GET', filename, true);
+      req.responseType = 'blob';
+      req.onload = function() {
+        loadCallback(req.response);
+        if (--assetsNeeded === 0) {
+          done();
+        }
+      };
+      req.send();
+    }
+    getAsset('/test/unit/media/IMG_0554.jpg', function(blob) {
+      oversizedImageBlob = blob;
+    });
+    getAsset('/test/unit/media/kitten-450.jpg', function(blob) {
+      smallImageBlob = blob;
+    });
   });
+
   suiteTeardown(function() {
     navigator.mozL10n = realMozL10n;
   });
 
   suite('Message Composition', function() {
-
-    var message;
+    var message,
+        subject,
+        sendButton;
 
     setup(function() {
       loadBodyHTML('/index.html');
-      // if we don't do the ThreadUI.init - it breaks when run in a full suite
-      ThreadUI.init();
-      // Compose.init('messages-compose-form');
+      Compose.init('messages-compose-form');
       message = document.querySelector('[contenteditable]');
+      subject = document.getElementById('messages-subject-input');
+      sendButton = document.getElementById('messages-send-button');
     });
-    suite('Placeholder', function() {
-      setup(function(done) {
+
+    suite('Subject', function() {
+      setup(function() {
         Compose.clear();
-        done();
+      });
+
+      test('Toggle field', function() {
+        assert.isTrue(subject.classList.contains('hide'));
+        // Show
+        Compose.toggleSubject();
+        assert.isFalse(subject.classList.contains('hide'));
+        // Hide
+        Compose.toggleSubject();
+        assert.isTrue(subject.classList.contains('hide'));
+      });
+
+      test('Get content from subject field', function() {
+        var content = 'Title';
+        subject.value = content;
+        // We need to show the subject to get content
+        Compose.toggleSubject();
+        assert.equal(Compose.getSubject(), content);
+      });
+
+      // Per discussion, this is being deferred to another bug
+      // https://bugzilla.mozilla.org/show_bug.cgi?id=959360
+      //
+      // test('Toggle type display visibility', function() {
+      //   assert.isFalse(sendButton.classList.contains('has-counter'));
+
+      //   subject.value = 'hi';
+      //   Compose.toggleSubject();
+      //   assert.isTrue(sendButton.classList.contains('has-counter'));
+
+      //   Compose.toggleSubject();
+      //   assert.isFalse(sendButton.classList.contains('has-counter'));
+      // });
+
+      test('Sent subject doesnt have line breaks (spaces instead)', function() {
+        // Set the value
+        subject.value = 'Line 1\nLine 2\n\n\n\nLine 3';
+        // We need to show the subject to get content
+        Compose.toggleSubject();
+        var text = Compose.getSubject();
+        assert.equal(text, 'Line 1 Line 2 Line 3');
+      });
+    });
+
+    suite('Placeholder', function() {
+      setup(function() {
+        Compose.clear();
       });
       test('Placeholder present by default', function() {
         assert.isTrue(Compose.isEmpty(), 'added');
@@ -76,7 +165,6 @@ suite('compose_test.js', function() {
       });
       test('Placeholder removed on input of attachment', function() {
         Compose.append(mockAttachment());
-        var txt = Compose.getContent();
         var contains = message.classList.contains('placeholder');
         // clearing to remove the iframe so that mocha doesn't
         // get alarmed at window[0] pointing to the iframe
@@ -109,6 +197,15 @@ suite('compose_test.js', function() {
         txt = Compose.getContent();
         assert.equal(txt.length, 0, 'No lines in the txt');
       });
+      test('Clear removes subject', function() {
+        subject.value = 'Title';
+        Compose.toggleSubject();
+        var txt = Compose.getSubject();
+        assert.equal(txt, 'Title', 'Something in the txt');
+        Compose.clear();
+        txt = Compose.getSubject();
+        assert.equal(txt, '', 'Nothing in the txt');
+      });
     });
 
     suite('Message insert, append, prepend', function() {
@@ -117,6 +214,19 @@ suite('compose_test.js', function() {
         var txt = Compose.getContent();
         assert.equal(txt[0], 'start', 'text is appended');
       });
+
+      test('Message appended with html', function() {
+        var message = document.querySelector(
+          '#messages-compose-form [contenteditable]'
+        );
+
+        Compose.append('<b>hi!</b>\ntest');
+        var txt = Compose.getContent();
+
+        assert.equal(message.innerHTML, '&lt;b&gt;hi!&lt;/b&gt;<br>test<br>');
+        assert.equal(txt[0], '<b>hi!</b>\ntest');
+      });
+
       test('Message prepend', function() {
         Compose.append('end');
         Compose.prepend('start');
@@ -125,6 +235,47 @@ suite('compose_test.js', function() {
       });
       teardown(function() {
         Compose.clear();
+      });
+    });
+
+    suite('Sending events in correct order', function() {
+      var onInput, onType, typeWhenEvent;
+
+      function captureType() {
+        typeWhenEvent = Compose.type;
+      }
+
+      setup(function() {
+        onInput = sinon.stub();
+        onType = sinon.spy(captureType);
+        Compose.type = 'sms';
+        Compose.on('input', onInput);
+        Compose.on('type', onType);
+      });
+
+      teardown(function() {
+        Compose.clearListeners();
+        typeWhenEvent = null;
+      });
+
+      test('appending text', function() {
+        Compose.append('start');
+        assert.ok(onInput.called);
+        assert.isFalse(onType.called);
+      });
+
+      test('appending attachment', function() {
+        Compose.append(mockAttachment());
+        assert.ok(onInput.called);
+        assert.ok(onType.called);
+        assert.ok(onInput.calledAfter(onType));
+        assert.equal(typeWhenEvent, 'mms');
+      });
+
+      test('changing type', function() {
+        Compose.type = 'mms';
+        assert.isFalse(onInput.called);
+        assert.ok(onType.called);
       });
     });
 
@@ -141,7 +292,7 @@ suite('compose_test.js', function() {
       });
       test('Just text - line breaks', function() {
         Compose.append('start');
-        Compose.append('<br>');
+        Compose.append('\n');
         Compose.append('end');
         var txt = Compose.getContent();
         assert.equal(txt.length, 1, 'Single text content');
@@ -149,10 +300,34 @@ suite('compose_test.js', function() {
       });
       test('Trailing line breaks not stripped', function() {
         Compose.append('start');
-        Compose.append('<br>');
+        Compose.append('\n');
         Compose.append('end');
-        Compose.append(new Array(5).join('<br>'));
+        Compose.append(new Array(5).join('\n'));
         var expected = 'start\nend\n\n\n\n';
+        var txt = Compose.getContent();
+        assert.equal(txt.length, 1, 'Single text content');
+        assert.equal(txt[0], expected, 'correct content');
+      });
+      test('Text with several spaces', function() {
+        Compose.append('start');
+        Compose.append('    ');
+        Compose.append('end');
+        var expected = 'start    end';
+        var txt = Compose.getContent();
+        assert.equal(txt.length, 1, 'Single text content');
+        assert.equal(txt[0], expected, 'correct content');
+
+        // the CSS we use is pre-wrap so we can use plain spaces
+        var html = message.innerHTML;
+        var expectedHTML = 'start    end<br>';
+        assert.equal(html, expectedHTML, 'correct markup');
+      });
+      test('Text with non-break spaces', function() {
+        Compose.append('start');
+        Compose.append('\u00A0\u00A0\u00A0');
+        Compose.append(' ');
+        Compose.append('end');
+        var expected = 'start    end';
         var txt = Compose.getContent();
         assert.equal(txt.length, 1, 'Single text content');
         assert.equal(txt[0], expected, 'correct content');
@@ -181,7 +356,7 @@ suite('compose_test.js', function() {
       });
       test('attachment with excess breaks', function() {
         Compose.append('start');
-        Compose.append('<br><br><br><br>');
+        Compose.append('\n\n\n\n');
         Compose.append(mockAttachment());
         Compose.append('end');
         var txt = Compose.getContent();
@@ -190,8 +365,90 @@ suite('compose_test.js', function() {
         assert.ok(txt[1] instanceof MockAttachment, 'Sub 1 is an attachment');
         assert.equal(txt[2], 'end', 'Last line is end text');
       });
+
+      test('text split in several text nodes', function() {
+        var lastChild = message.lastChild;
+        message.insertBefore(document.createTextNode('hello'), lastChild);
+        message.insertBefore(document.createTextNode(''), lastChild);
+        message.insertBefore(document.createTextNode('world'), lastChild);
+
+        var content = Compose.getContent();
+        assert.equal(content.length, 1);
+        assert.equal(content[0], 'helloworld');
+      });
+
       teardown(function() {
         Compose.clear();
+      });
+    });
+
+    suite('Preload composer fromDraft', function() {
+      var d1, d2, attachment;
+
+      setup(function() {
+        Compose.clear();
+        d1 = new Draft({
+          subject: '...',
+          content: ['I am a draft'],
+          threadId: 1
+        });
+        attachment = mockAttachment();
+        d2 = new Draft({
+          content: ['I have an attachment!', attachment],
+          threadId: 1
+        });
+      });
+      teardown(function() {
+
+        Compose.clear();
+      });
+
+      test('Draft with text', function() {
+        Compose.fromDraft(d1);
+        assert.equal(Compose.getContent(), d1.content.join(''));
+      });
+
+      test('Draft with subject', function() {
+        assert.isFalse(Compose.isSubjectVisible);
+        Compose.fromDraft(d1);
+        assert.equal(Compose.getSubject(), d1.subject);
+        assert.isTrue(Compose.isSubjectVisible);
+      });
+
+      test('Draft without subject', function() {
+        Compose.fromDraft(d2);
+        assert.isFalse(Compose.isSubjectVisible);
+      });
+
+      test('Draft with attachment', function() {
+        Compose.fromDraft(d2);
+        var txt = Compose.getContent();
+        assert.ok(txt, d2.content.join(''));
+        assert.ok(txt[1] instanceof Attachment);
+      });
+    });
+
+    suite('Changing content marks draft as edited', function() {
+
+      setup(function() {
+        ThreadUI.draft = new Draft({
+          isEdited: false
+        });
+      });
+
+      test('Changing message', function() {
+        Compose.append('Message');
+        assert.isTrue(ThreadUI.draft.isEdited);
+      });
+
+      test('Changing subject', function() {
+        Compose.toggleSubject();
+        assert.isTrue(ThreadUI.draft.isEdited);
+      });
+
+      test('Changing attachments', function() {
+        Compose.append(mockAttachment(12345));
+        assert.isTrue(ThreadUI.draft.isEdited);
       });
     });
 
@@ -240,6 +497,31 @@ suite('compose_test.js', function() {
         var activity = MockMozActivity.instances[0];
         activity.onerror();
       });
+      test('Triggers a "file too large" error when the returned file ' +
+        'exceeds the maxmium MMS size limit', function(done) {
+        var req = Compose.requestAttachment();
+        var activity = MockMozActivity.instances[0];
+        var origLimit = Settings.mmsSizeLimitation;
+        var largeBlob;
+
+        Settings.mmsSizeLimitation = 45;
+        largeBlob = new Blob([
+          new Array(Settings.mmsSizeLimitation + 3).join('a')
+        ]);
+
+        req.onerror = function(err) {
+          assert.equal(err, 'file too large');
+          Settings.mmsSizeLimitation = origLimit;
+          done();
+        };
+
+        // Simulate a successful 'pick' MozActivity
+        activity.result = {
+          name: 'test',
+          blob: largeBlob
+        };
+        activity.onsuccess();
+      });
     });
 
     suite('Getting size via size getter', function() {
@@ -270,7 +552,7 @@ suite('compose_test.js', function() {
         Compose.clear();
       });
 
-      test('Attaching creates iframe.attachment', function() {
+      test('Attaching creates iframe.attachment-container', function() {
         var attachment = mockAttachment();
         Compose.append(attachment);
         var iframes = message.querySelectorAll('iframe');
@@ -279,69 +561,321 @@ suite('compose_test.js', function() {
         // get alarmed at window[0] pointing to the iframe
         Compose.clear();
         assert.equal(iframes.length, 1, 'One iframe');
-        assert.ok(iframes[0].classList.contains('attachment'), '.attachment');
+        assert.ok(iframes[0].classList.contains('attachment-container'),
+          '.attachment-container');
         assert.ok(txt[0] === attachment, 'iframe WeakMap\'d to attachment');
+      });
+    });
+
+    suite('Image Attachment Handling', function() {
+      var realgetResizedImgBlob;
+      setup(function() {
+        Compose.clear();
+      });
+      suiteSetup(function() {
+        realgetResizedImgBlob = Utils.getResizedImgBlob;
+        Utils.getResizedImgBlob = function mockResize() {
+          Utils.getResizedImgBlob.args = arguments;
+          realgetResizedImgBlob.apply(null, arguments);
+        };
+      });
+      suiteTeardown(function() {
+        Utils.getResizedImgBlob = realgetResizedImgBlob;
+      });
+      test('Attaching one image', function(done) {
+        var actualSize;
+        function onInput() {
+          if (!Compose.isResizing) {
+            Compose.off('input', onInput);
+            var img = Compose.getContent();
+            assert.equal(img.length, 1, 'One image');
+            assert.notEqual(actualSize, Compose.size,
+              'the size was recalculated after resizing');
+            done();
+          }
+        }
+        Compose.on('input', onInput);
+        Compose.append(mockImgAttachment());
+        // we store this so we can make sure it gets resized
+        actualSize = Compose.size;
+      });
+      test('Attaching another oversized image', function(done) {
+        function onInput() {
+          if (!Compose.isResizing) {
+            var images = message.querySelectorAll('iframe');
+
+            if (images.length < 2) {
+              Compose.append(mockImgAttachment(true));
+            } else {
+              Compose.off('input', onInput);
+              assert.equal(images.length, 2, 'two images');
+              assert.equal(Compose.getContent()[1], 'append more image',
+                'Second attachment is text');
+              assert.isTrue(Utils.getResizedImgBlob.args[1] ===
+                            Settings.mmsSizeLimitation * 0.4,
+                'getResizedImgBlob should set to 2/5 MMS size');
+              assert.isTrue(Compose.getContent()[2].size <
+                            Settings.mmsSizeLimitation * 0.4,
+                'Image attachment is resized');
+              done();
+            }
+          }
+        }
+        Compose.on('input', onInput);
+        Compose.append(mockImgAttachment(true));
+        Compose.append('append more image');
+      });
+      test('Third image attached, size limitation should changed',
+        function(done) {
+        function onInput() {
+          if (!Compose.isResizing) {
+            var images = Compose.getContent();
+            if (images.length < 3) {
+              Compose.append(mockImgAttachment(true));
+            } else {
+              Compose.off('input', onInput);
+              assert.equal(images.length, 3, 'three images');
+              assert.isTrue(Utils.getResizedImgBlob.args[1] ===
+                            Settings.mmsSizeLimitation * 0.2,
+                'getResizedImgBlob should set to 1/5 MMS size');
+              images.forEach(function(img) {
+                assert.isTrue(img.size < Settings.mmsSizeLimitation * 0.2,
+                  'Image attachment is resized');
+              });
+              done();
+            }
+          }
+        }
+        Compose.on('input', onInput);
+        Compose.append(mockImgAttachment());
       });
     });
 
     suite('Message Type Events', function() {
       var form;
       var expectType = 'sms';
+
       function typeChange(event) {
         assert.equal(Compose.type, expectType);
         typeChange.called++;
       }
-      suiteSetup(function() {
-        Compose.on('type', typeChange);
-      });
-      suiteTeardown(function() {
-        Compose.off('type', typeChange);
-      });
+
       setup(function() {
         expectType = 'sms';
         Compose.clear();
         typeChange.called = 0;
         form = document.getElementById('messages-compose-form');
+
+        Compose.on('type', typeChange);
       });
+
+      teardown(function() {
+        Compose.off('type', typeChange);
+      });
+
       test('Message switches type when adding/removing attachment',
         function() {
-        // form must have the data-message-type set
-        assert.equal(form.dataset.messageType, 'sms');
-
         expectType = 'mms';
         Compose.append(mockAttachment());
-        assert.equal(form.dataset.messageType, 'mms');
         assert.equal(typeChange.called, 1);
 
         expectType = 'sms';
         Compose.clear();
-        assert.equal(form.dataset.messageType, 'sms');
         assert.equal(typeChange.called, 2);
       });
-      test('Message type switch is cancelable', function() {
-        expectType = 'mms';
-        Compose.append(mockAttachment());
-        assert.equal(typeChange.called, 1);
 
-        // bind a cancel
-        function cancelChange(event) {
-          event.preventDefault();
-        }
-        Compose.on('type', cancelChange);
+      test('Message switches type when adding/removing subject',
+        function() {
+        expectType = 'mms';
+        Compose.toggleSubject();
+        subject.value = 'foo';
+        subject.dispatchEvent(new CustomEvent('input'));
+        assert.equal(typeChange.called, 1);
 
         expectType = 'sms';
         Compose.clear();
         assert.equal(typeChange.called, 2);
-        // type is still mms because we canceled
-        assert.equal(Compose.type, 'mms');
-        assert.equal(form.dataset.messageType, 'mms');
+      });
+    });
 
-        // unbind cancel
-        Compose.off('type', cancelChange);
-        Compose.clear();
-        assert.equal(Compose.type, 'sms');
-        assert.equal(form.dataset.messageType, 'sms');
+    suite('changing inputmode', function() {
+      test('initial inputmode is sms', function() {
+        assert.equal(message.getAttribute('x-inputmode'), '-moz-sms');
+      });
+
+      test('changing type to mms', function() {
+        Compose.type = 'mms';
+
+        assert.isFalse(message.hasAttribute('x-inputmode'));
+      });
+
+      test('changing type to mms then sms', function() {
+        Compose.type = 'mms';
+        Compose.type = 'sms';
+
+        assert.equal(message.getAttribute('x-inputmode'), '-moz-sms');
+      });
+    });
+
+    suite('Compose fromMessage', function() {
+      setup(function() {
+        this.sinon.spy(Compose, 'append');
+        this.sinon.spy(HTMLElement.prototype, 'focus');
+        this.sinon.stub(SMIL, 'parse');
+      });
+      test('from sms', function() {
+        Compose.fromMessage({type: 'sms', body: 'test'});
+        sinon.assert.called(Compose.append);
+        sinon.assert.called(message.focus);
+      });
+
+      test('from mms', function() {
+        var testString = ['test\nstring 1\nin slide 1',
+                          'test\nstring 2\nin slide 2'];
+        Compose.fromMessage({type: 'mms'});
+
+        // Should not be focused before parse complete.
+        sinon.assert.notCalled(message.focus);
+        assert.isTrue(message.classList.contains('ignoreEvents'));
+        SMIL.parse.yield([{text: testString[0]}, {text: testString[1]}]);
+
+        sinon.assert.calledWith(Compose.append);
+        sinon.assert.called(message.focus);
+        assert.isFalse(message.classList.contains('ignoreEvents'));
       });
     });
   });
+
+  suite('Attachment pre-send menu', function() {
+    setup(function() {
+      this.attachment = mockImgAttachment();
+      Compose.clear();
+      Compose.append(this.attachment);
+      this.attachmentSize = Compose.size;
+      this.sinon.stub(AttachmentMenu, 'open');
+      this.sinon.stub(AttachmentMenu, 'close');
+
+      // trigger a click on attachment
+      this.attachment.mNextRender.click();
+    });
+    test('click opens menu', function() {
+      assert.isTrue(AttachmentMenu.open.called);
+    });
+    test('open called with correct attachment', function() {
+      assert.ok(AttachmentMenu.open.calledWith(this.attachment));
+    });
+    suite('clicking on buttons', function() {
+      suite('view', function() {
+        setup(function() {
+          this.sinon.stub(this.attachment, 'view');
+
+          // trigger click on view
+          document.getElementById('attachment-options-view').click();
+        });
+        test('clicking on view calls attachment.view', function() {
+          assert.isTrue(this.attachment.view.called);
+        });
+      });
+
+      suite('remove', function() {
+        setup(function() {
+          // trigger click on remove
+          document.getElementById('attachment-options-remove').click();
+        });
+        test('removes the original attachment', function() {
+          assert.ok(!this.attachment.mNextRender.parentNode);
+        });
+        test('closes the menu', function() {
+          assert.isTrue(AttachmentMenu.close.called);
+        });
+        test('recalculates size', function() {
+          assert.equal(Compose.size, 0, 'size should be 0 after remove');
+          assert.notEqual(Compose.size, this.attachmentSize,
+            'size is changed after removing attachment');
+        });
+      });
+
+      suite('cancel', function() {
+        setup(function() {
+          // trigger click on close
+          document.getElementById('attachment-options-cancel').click();
+        });
+        test('closes the menu', function() {
+          assert.isTrue(AttachmentMenu.close.called);
+        });
+      });
+
+      suite('replace', function() {
+        setup(function(done) {
+          this.replacement = mockImgAttachment(true);
+          this.sinon.stub(Compose, 'requestAttachment', function() {
+            var mockResult = {};
+            setTimeout(function() {
+              mockResult.onsuccess(this.replacement);
+              this.replacementSize = Compose.size;
+              done();
+            }.bind(this));
+            return mockResult;
+          }.bind(this));
+          this.sinon.stub(Utils, 'getResizedImgBlob');
+
+          // trigger click on replace
+          document.getElementById('attachment-options-replace').click();
+        });
+        test('clicking on replace requests an attachment', function() {
+          assert.isTrue(Compose.requestAttachment.called);
+        });
+        test('removes the original attachment', function() {
+          assert.ok(!this.attachment.mNextRender.parentNode);
+        });
+        test('inserts the new attachment', function() {
+          assert.ok(this.replacement.mNextRender.parentNode);
+        });
+        test('closes the menu', function() {
+          assert.isTrue(AttachmentMenu.close.called);
+        });
+        test('recalculates size', function() {
+          assert.notEqual(this.replacementSize, this.attachmentSize,
+            'Size was recalculated to be the new size');
+        });
+        test('resizes image', function() {
+          assert.ok(Utils.getResizedImgBlob.called);
+        });
+        suite('after resize', function() {
+          setup(function() {
+            Utils.getResizedImgBlob.args[0][2](smallImageBlob);
+          });
+
+          test('recalculates size again', function() {
+            assert.notEqual(Compose.size, this.replacementSize);
+          });
+        });
+      });
+    });
+  });
+
+  suite('Image attachment pre-send menu', function() {
+    setup(function() {
+      this.sinon.stub(AttachmentMenu, 'open');
+      this.sinon.stub(AttachmentMenu, 'close');
+    });
+    test('click opens menu while resizing and resize complete', function(done) {
+      Compose.clear();
+      var imageAttachment = mockImgAttachment(true);
+      function onInput() {
+        if (!Compose.isResizing) {
+          Compose.off('input', onInput);
+          imageAttachment.mNextRender.click();
+          assert.isTrue(AttachmentMenu.open.called, 'Menu should popup');
+          done();
+        }
+      }
+      Compose.on('input', onInput);
+      Compose.append(imageAttachment);
+      imageAttachment.mNextRender.click();
+      assert.isFalse(AttachmentMenu.open.called,
+        'Menu could not be opened while ressizing');
+    });
+  });
 });
+

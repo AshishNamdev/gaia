@@ -1,8 +1,14 @@
 requireLib('provider/abstract.js');
 requireLib('template.js');
 requireLib('querystring.js');
+requireElements('calendar/elements/modify_event.html');
+requireElements('calendar/elements/show_event.html');
+
+mocha.globals(['InputParser']);
 
 suiteGroup('Views.ModifyEvent', function() {
+  /** disabled because of intermittent failures see bug 917537 */
+  return;
 
   var subject;
   var controller;
@@ -63,56 +69,25 @@ suiteGroup('Views.ModifyEvent', function() {
   }
 
   var triggerEvent;
-  var InputParser;
   suiteSetup(function() {
     triggerEvent = testSupport.calendar.triggerEvent;
-    InputParser = Calendar.Utils.InputParser;
   });
 
   var realGo;
 
   teardown(function() {
-    var el = document.getElementById('test');
-    el.parentNode.removeChild(el);
     Calendar.App.go = realGo;
   });
 
-  setup(function(done) {
-    var div = document.createElement('div');
-    div.id = 'test';
-    div.innerHTML = [
-      '<div id="event-view">',
-        '<button class="edit">edit</button>',
-        '<button class="cancel">cancel</button>',
-      '</div>',
-      '<div id="modify-event-view">',
-        '<button class="save">save</button>',
-        '<button class="cancel">cancel</button>',
-        '<button class="delete-record">delete</button>',
-        '<section role="status">',
-          '<div class="errors"></div>',
-        '</section>',
-        '<form>',
-          '<input type="checkbox" name="allday" />',
-          '<input name="title" />',
-          '<input type="date" name="startDate" />',
-          '<span id="start-date-locale"></span>',
-          '<input type="date" name="endDate" />',
-          '<span id="end-date-locale"></span>',
-          '<input type="time" name="startTime" />',
-          '<span id="start-time-locale"></span>',
-          '<input type="time" name="endTime" />',
-          '<span id="end-time-locale"></span>',
-          '<input name="location" />',
-          '<textarea name="description"></textarea>',
-          '<input name="currentCalendar" />',
-          '<select name="calendarId"></select>',
-          '<div class="alarms"></div>',
-        '</form>',
-      '</div>'
-    ].join('');
+  suiteTemplate('show-event', {
+    id: 'event-view'
+  });
 
-    document.body.appendChild(div);
+  suiteTemplate('modify-event', {
+    id: 'modify-event-view'
+  });
+
+  setup(function(done) {
     app = testSupport.calendar.app();
     realGo = app.go;
 
@@ -335,10 +310,10 @@ suiteGroup('Views.ModifyEvent', function() {
             startDate: busytimeRecurring.startDate,
             endDate: busytimeRecurring.endDate
           };
-          assert.hasProperties(
-            subject.formData(),
-            expected
-          );
+
+          var actual = subject.formData();
+          actual.calendarId = parseInt(actual.calendarId, 10);
+          assert.hasProperties(actual, expected);
         });
       });
     });
@@ -378,7 +353,7 @@ suiteGroup('Views.ModifyEvent', function() {
     });
 
 
-    // this allows to test _updateDateTimeLocale()
+    // this allows to test _setupDateTimeSync() - before user changes value
     test('date/time are displayed according to the locale', function(done) {
       remote.startDate = new Date(2012, 11, 30, 1, 2);
       remote.endDate = new Date(2012, 11, 31, 13, 4);
@@ -399,6 +374,50 @@ suiteGroup('Views.ModifyEvent', function() {
         });
       });
     });
+
+    suite('#_updateDateLocaleOnInput', function() {
+      var clock;
+      var element;
+      var evt;
+
+      setup(function() {
+        element = {};
+        evt = { target: {} };
+      });
+
+      teardown(function() {
+        clock.restore();
+      });
+
+      test('should localize date', function() {
+        var baseTimestamp = (new Date(2014, 0, 20).getTime());
+        clock = sinon.useFakeTimers(baseTimestamp);
+        evt.target.value = '2014-01-21';
+        subject._updateDateLocaleOnInput(element, evt);
+        assert.equal(element.textContent, '01/21/2014');
+      });
+
+      test('display proper month - Bug 966516', function() {
+        // it's really important to mock the Date to be able to reproduce the
+        // Bug 966516, since it only happened if system date was a day higher
+        // than next month end date (eg. Jan 31 and you pick Feb 28)
+        var baseTimestamp = (new Date(2014, 0, 31, 2, 30)).getTime();
+        clock = sinon.useFakeTimers(baseTimestamp);
+        evt.target.value = '2014-02-28';
+        subject._updateDateLocaleOnInput(element, evt);
+        assert.equal(element.textContent, '02/28/2014');
+      });
+    });
+
+    suite('#_updateTimeLocaleOnInput', function() {
+      test('should localize time', function() {
+        var element = {};
+        var evt = { target: { value: '22:31' } };
+        subject._updateTimeLocaleOnInput(element, evt);
+        assert.equal(element.textContent, '10:31 PM');
+      });
+    });
+
   });
 
   suite('#_overrideEvent', function(done) {
@@ -867,6 +886,7 @@ suiteGroup('Views.ModifyEvent', function() {
 
     test('remove calendar (#_removeCalendarId)', function(done) {
       subject.onremovecalendar = function() {
+        subject.onremovecalendar = null;
         done(function() {
           assert.length(element.children, 2, 'removed one');
 
@@ -877,6 +897,7 @@ suiteGroup('Views.ModifyEvent', function() {
         });
       };
 
+      calendarStore.emit('preRemove', calendars.one._id);
       calendarStore.emit('remove', calendars.one._id);
     });
   });
@@ -885,6 +906,8 @@ suiteGroup('Views.ModifyEvent', function() {
 
     var defaultAllDayAlarm;
     var defaultEventAlarm;
+    var morning = 3600 * 9;
+    var oneHour = 3600;
 
     setup(function(done) {
       var pending = 3;
@@ -1015,6 +1038,88 @@ suiteGroup('Views.ModifyEvent', function() {
         done();
       });
     });
+
+    function testDefaultAlarms(isAllDay, defaultValue, done) {
+      settingStore.getValue('alldayAlarmDefault', function(err, value) {
+        var defaultAlarm = value;
+        var defaultAlarmKey;
+        if (isAllDay === true) {
+          defaultAlarmKey = 'alldayAlarmDefault';
+        } else {
+          defaultAlarmKey = 'standardAlarmDefault';
+        }
+        settingStore.set(defaultAlarmKey, defaultValue, function(err, value) {
+          provider.createEvent = function(event, callback) {
+            var data = subject.formData();
+
+            callback();
+
+            if (defaultValue === 'none') {
+              assert.deepEqual(
+                data.alarms[0].trigger,
+                123,
+                'alarms'
+              );
+            } else {
+              assert.deepEqual(
+                data.alarms[0].trigger,
+                defaultValue,
+                'alarms'
+              );
+            }
+            settingStore.set(defaultAlarmKey, defaultAlarm,
+              function(err, value) {
+                done();
+              }
+            );
+          };
+          var allday = subject.getEl('allday');
+          allday.checked = isAllDay;
+          subject.event.isAllDay = isAllDay;
+          subject.updateAlarms(isAllDay, function() {
+            var allAlarms = subject.alarmList.querySelectorAll('select');
+            var firstSelect = allAlarms[0];
+            assert.ok(firstSelect);
+            if (defaultValue === 'none') {
+              assert.equal(allAlarms.length, 1);
+              var newOption = document.createElement('option');
+              newOption.value = '123';
+              firstSelect.appendChild(newOption);
+              firstSelect.value = '123';
+            } else {
+              assert.equal(allAlarms.length, 2);
+            }
+            subject.primary();
+          });
+        });
+      });
+    }
+
+    test('Bug 898242 - when allday alarm default is none', function(done) {
+      var isAllDay = true;
+      var defaultValue = 'none';
+      testDefaultAlarms(isAllDay, defaultValue, done);
+    });
+
+    test('Bug 898242 - when allday alarm default is not none', function(done) {
+      var isAllDay = true;
+      var defaultValue = morning;
+      testDefaultAlarms(isAllDay, defaultValue, done);
+    });
+
+    test('Bug 898242 - when standard alarm default is none', function(done) {
+      var isAllDay = false;
+      var defaultValue = 'none';
+      testDefaultAlarms(isAllDay, defaultValue, done);
+    });
+
+    test('Bug 898242 - when standard alarm default is not none',
+      function(done) {
+        var isAllDay = false;
+        var defaultValue = oneHour;
+        testDefaultAlarms(isAllDay, defaultValue, done);
+      }
+    );
   });
 
   suite('#returnTo', function() {

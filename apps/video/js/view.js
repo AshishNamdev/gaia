@@ -11,7 +11,6 @@
  */
 navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
   var dom = {};            // document elements
-  var screenLock;          // keep the screen on when playing
   var playing = false;
   var endedTimer;
   var controlShowing = false;
@@ -24,6 +23,13 @@ navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
   var title = data.title || '';
   var storage;       // A device storage object used by the save button
   var saved = false; // Did we save it?
+  var endedTimer;    // The workaround of bug 783512.
+  var videoRotation = 0;
+  // touch start id is the identifier of touch event. we only need to process
+  // events related to this id.
+  var touchStartID = null;
+  var isPausedWhileDragging;
+  var sliderRect;
 
   initUI();
 
@@ -38,54 +44,58 @@ navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
     // If the app that initiated this activity wants us to allow the
     // user to save this blob as a file, and if device storage is available
     // and if there is enough free space, then display a save button.
-    if (data.allowSave && data.filename) {
+    if (data.allowSave && data.filename && checkFilename()) {
       getStorageIfAvailable('videos', blob.size, function(ds) {
         storage = ds;
         dom.menu.hidden = false;
       });
     }
-  }
 
-  if (type !== 'video/youtube') {
+    // to hide player because it shows in the wrong rotation.
+    dom.player.classList.add('hidden');
+    // video rotation is not parsed, parse it.
+    getVideoRotation(blob, function(rotation) {
+      // when error found, fallback to 0
+      if (typeof rotation === 'string') {
+        console.error('get video rotation error: ' + rotation);
+        videoRotation = 0;
+      } else {
+        videoRotation = rotation;
+      }
+      // show player when player size and rotation are correct.
+      dom.player.classList.remove('hidden');
+      // start to play the video that showPlayer also calls fitContainer.
+      showPlayer(url, title);
+    });
+  } else {
+    // In the url case, we don't need to calculate the rotation.
     showPlayer(url, title);
-    return;
   }
 
-  // This is the youtube case. We need to ensure that we have been
-  // localized before trying to fetch the youtube video so youtube
-  // knows what language to send errors to us in.
-  // XXX: show a loading spinner here?
-  if (navigator.mozL10n.readyState === 'complete') {
-    getYoutubeVideo(url, showPlayer, handleError);
-  }
-  else {
-    window.addEventListener('localized', function handleLocalized() {
-      window.removeEventListener('localized', handleLocalized);
-      getYoutubeVideo(url, showPlayer, handleError);
+  // Terminate video playback when visibility is changed.
+  window.addEventListener('visibilitychange',
+    function onVisibilityChanged() {
+      if (document.hidden) {
+        done();
+      }
+    });
+
+  // We get headphoneschange event when the headphones is plugged or unplugged
+  var acm = navigator.mozAudioChannelManager;
+  if (acm) {
+    acm.addEventListener('headphoneschange', function onheadphoneschange() {
+      if (!acm.headphones && playing) {
+        setVideoPlaying(false);
+      }
     });
   }
 
-  function handleError(message) {
-    // Start with a localized error message prefix
-    var error = navigator.mozL10n.get('youtube-error-prefix');
-
-    if (message) {
-      // Remove any HTML tags from the youtube error message
-      var div = document.createElement('div');
-      div.innerHTML = message;
-      message = div.textContent;
-      error += '\n\n' + message;
+  function setVideoPlaying(playing) {
+    if (playing) {
+      play();
+    } else {
+      pause();
     }
-
-    // Display the error message to the user
-    // XXX Using alert() is simple but ugly.
-    alert(error);
-
-    // When the user clicks okay, end the activity.
-    // Do this on a timer so the alert has time to go away.
-    // Otherwise it appears to remain up over the caller and the user
-    // has to dismiss it twice. See bug 825435.
-    setTimeout(function() { activity.postResult({}); }, 50);
   }
 
   function initUI() {
@@ -93,8 +103,8 @@ navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
     // so we'll play the video without going into fullscreen mode.
 
     // Get all the elements we use by their id
-    var ids = ['player', 'videoFrame', 'videoControls',
-               'close', 'play', 'playHead',
+    var ids = ['player', 'player-view', 'videoControls',
+               'close', 'play', 'playHead', 'video-container',
                'elapsedTime', 'video-title', 'duration-text', 'elapsed-text',
                'slider-wrapper', 'spinner-overlay',
                'menu', 'save', 'banner', 'message'];
@@ -111,18 +121,36 @@ navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
 
     dom.player.mozAudioChannelType = 'content';
 
-    // show|hide controls over the player
-    dom.videoControls.addEventListener('mousedown', playerMousedown);
+    // handling the dragging of slider
+    dom.sliderWrapper.addEventListener('touchstart', handleSliderTouchStart);
+    dom.sliderWrapper.addEventListener('touchmove', handleSliderTouchMove);
+    dom.sliderWrapper.addEventListener('touchend', handleSliderTouchEnd);
 
     // Rescale when window size changes. This should get called when
     // orientation changes.
     window.addEventListener('resize', function() {
       if (dom.player.readyState !== dom.player.HAVE_NOTHING) {
-        setPlayerSize();
+        VideoUtils.fitContainer(dom.videoContainer, dom.player,
+                                videoRotation || 0);
       }
     });
 
     dom.player.addEventListener('timeupdate', timeUpdated);
+
+    // showing + hiding the loading spinner
+    dom.player.addEventListener('waiting', showSpinner);
+    dom.player.addEventListener('playing', hideSpinner);
+    dom.player.addEventListener('play', hideSpinner);
+    dom.player.addEventListener('pause', hideSpinner);
+    dom.player.addEventListener('ended', playerEnded);
+    dom.player.addEventListener('canplaythrough', hideSpinner);
+
+    // option buttons
+    dom.play.addEventListener('click', handlePlayButtonClick);
+    dom.close.addEventListener('click', done);
+    dom.save.addEventListener('click', save);
+    // show/hide controls
+    dom.videoControls.addEventListener('click', toggleVideoControls, true);
 
     // Set the 'lang' and 'dir' attributes to <html> when the page is translated
     window.addEventListener('localized', function showBody() {
@@ -131,40 +159,72 @@ navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
     });
   }
 
+  function checkFilename() {
+    var dotIdx = data.filename.lastIndexOf('.');
+    if (dotIdx > -1) {
+      var ext = data.filename.substr(dotIdx + 1);
+      return MimeMapper.guessTypeFromExtension(ext) === blob.type;
+    } else {
+      return false;
+    }
+  }
+
   function setControlsVisibility(visible) {
     dom.videoControls.classList[visible ? 'remove' : 'add']('hidden');
     controlShowing = visible;
+    if (visible) {
+      // update elapsed time and slider while showing.
+      updateSlider();
+    }
   }
 
-  function playerMousedown(event) {
-    // If we interact with the controls before they fade away,
-    // cancel the fade
+  function handlePlayButtonClick() {
+    setVideoPlaying(dom.player.paused);
+  }
+
+  function toggleVideoControls(e) {
+    // When we change the visibility state of video controls, we need to check
+    // the timeout of auto hiding.
     if (controlFadeTimeout) {
       clearTimeout(controlFadeTimeout);
       controlFadeTimeout = null;
     }
+    // We cannot change the visibility state of video contorls when we are in
+    // picking mode.
     if (!controlShowing) {
+      // If control not shown, tap any place to show it.
       setControlsVisibility(true);
-      return;
-    }
-    if (event.target == dom.play) {
-      if (dom.player.paused)
-        play();
-      else
-        pause();
-    } else if (event.target == dom.close) {
-      done();
-    } else if (event.target == dom.save) {
-      save();
-    } else if (event.target == dom.sliderWrapper) {
-      dragSlider(event);
-    } else {
+      e.cancelBubble = true;
+    } else if (e.originalTarget === dom.videoControls) {
+      // If control is shown, only tap the empty area should show it.
       setControlsVisibility(false);
     }
   }
 
+  function handleSliderTouchStart(event) {
+    // If we have a touch start event, we don't need others.
+    if (null != touchStartID) {
+      return;
+    }
+    touchStartID = event.changedTouches[0].identifier;
+
+    isPausedWhileDragging = dom.player.paused;
+    dragging = true;
+    // calculate the slider wrapper size for slider dragging.
+    sliderRect = dom.sliderWrapper.getBoundingClientRect();
+
+    // We can't do anything if we don't know our duration
+    if (dom.player.duration === Infinity)
+      return;
+
+    if (!isPausedWhileDragging) {
+      dom.player.pause();
+    }
+
+    handleSliderTouchMove(event);
+  }
+
   function done() {
-    // release our screen lock
     pause();
 
     // Release any video resources
@@ -198,49 +258,19 @@ navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
     });
   }
 
-  // Make the video fit the container
-  function setPlayerSize() {
-    var containerWidth = window.innerWidth;
-    var containerHeight = window.innerHeight;
-
-    // Don't do anything if we don't know our size.
-    // This could happen if we get a resize event before our metadata loads
-    if (!dom.player.videoWidth || !dom.player.videoHeight)
-      return;
-
-    var width = dom.player.videoWidth;
-    var height = dom.player.videoHeight;
-    var xscale = containerWidth / width;
-    var yscale = containerHeight / height;
-    var scale = Math.min(xscale, yscale);
-
-    // scale large videos down, and scale small videos up
-    width *= scale;
-    height *= scale;
-
-    var left = ((containerWidth - width) / 2);
-    var top = ((containerHeight - height) / 2);
-
-    var transform = 'translate(' + left + 'px,' + top + 'px)';
-
-    transform += ' scale(' + scale + ')';
-
-    dom.player.style.transform = transform;
-  }
-
   // show video player
   function showPlayer(url, title) {
-    // Dismiss the spinner
-    dom.spinnerOverlay.classList.add('hidden');
 
     dom.videoTitle.textContent = title || '';
     dom.player.src = url;
     dom.player.onloadedmetadata = function() {
-      dom.durationText.textContent = formatDuration(dom.player.duration);
+      dom.durationText.textContent = MediaUtils.formatDuration(
+        dom.player.duration);
       timeUpdated();
 
       dom.play.classList.remove('paused');
-      setPlayerSize();
+      VideoUtils.fitContainer(dom.videoContainer, dom.player,
+                              videoRotation || 0);
 
       dom.player.currentTime = 0;
 
@@ -253,6 +283,37 @@ navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
       play();
     };
     dom.player.onloadeddata = function(evt) { URL.revokeObjectURL(url); };
+    dom.player.onerror = function(evt) {
+      var errorid = '';
+
+      switch (evt.target.error.code) {
+        case MediaError.MEDIA_ERR_ABORTED:
+          // This aborted error should be triggered by the user
+          // so we don't have to show any error messages
+          return;
+        case MediaError.MEDIA_ERR_NETWORK:
+          errorid = 'error-network';
+          break;
+        case MediaError.MEDIA_ERR_DECODE:
+        case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
+          // If users tap some video link in an offline page
+          // the error code will be MEDIA_ERR_SRC_NOT_SUPPORTED
+          // we also prompt the unsupported error message for it
+          errorid = 'error-unsupported';
+          break;
+        // Is it possible to be unknown errors?
+        default:
+          errorid = 'error-unknown';
+          break;
+      }
+
+      handleError(navigator.mozL10n.get(errorid));
+    };
+  }
+
+  function handleError(msg) {
+    alert(msg);
+    done();
   }
 
   function play() {
@@ -262,10 +323,6 @@ navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
     // Start playing
     dom.player.play();
     playing = true;
-
-    // Don't let the screen go to sleep
-    if (!screenLock)
-      screenLock = navigator.requestWakeLock('screen');
   }
 
   function pause() {
@@ -275,12 +332,6 @@ navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
     // Stop playing the video
     dom.player.pause();
     playing = false;
-
-    // Let the screen go to sleep
-    if (screenLock) {
-      screenLock.unlock();
-      screenLock = null;
-    }
   }
 
   // Update the progress bar and play head as the video plays
@@ -293,87 +344,98 @@ navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
         return;
       }
 
-      var percent = (dom.player.currentTime / dom.player.duration) * 100;
-      if (isNaN(percent)) // this happens when we end the activity
-        return;
-      percent += '%';
+      updateSlider();
+    }
 
-      dom.elapsedText.textContent = formatDuration(dom.player.currentTime);
-      dom.elapsedTime.style.width = percent;
-      // Don't move the play head if the user is dragging it.
-      if (!dragging)
-        dom.playHead.style.left = percent;
+    // Since we don't always get reliable 'ended' events, see if
+    // we've reached the end this way.
+    // See: https://bugzilla.mozilla.org/show_bug.cgi?id=783512
+    // If we're within 1 second of the end of the video, register
+    // a timeout a half a second after we'd expect an ended event.
+    if (!endedTimer) {
+      if (!dragging && dom.player.currentTime >= dom.player.duration - 1) {
+        var timeUntilEnd = (dom.player.duration - dom.player.currentTime + .5);
+        endedTimer = setTimeout(playerEnded, timeUntilEnd * 1000);
+      }
+    } else if (dragging && dom.player.currentTime < dom.player.duration - 1) {
+      // If there is a timer set and we drag away from the end, cancel the timer
+      clearTimeout(endedTimer);
+      endedTimer = null;
     }
   }
 
-  // handle drags on the time slider
-  function dragSlider(e) {
-    var isPaused = dom.player.paused;
-    dragging = true;
-
-    // We can't do anything if we don't know our duration
-    if (dom.player.duration === Infinity)
+  function playerEnded() {
+    if (dragging) {
       return;
-
-    if (!isPaused) {
-      dom.player.pause();
+    }
+    if (endedTimer) {
+      clearTimeout(endedTimer);
+      endedTimer = null;
     }
 
-    // Capture all mouse moves and the mouse up
-    document.addEventListener('mousemove', mousemoveHandler, true);
-    document.addEventListener('mouseup', mouseupHandler, true);
-
-    function position(event) {
-      var rect = dom.sliderWrapper.getBoundingClientRect();
-      var position = (event.clientX - rect.left) / rect.width;
-      position = Math.max(position, 0);
-      position = Math.min(position, 1);
-      return position;
-    }
-
-    function mouseupHandler(event) {
-      document.removeEventListener('mousemove', mousemoveHandler, true);
-      document.removeEventListener('mouseup', mouseupHandler, true);
-
-      dragging = false;
-
-      dom.playHead.classList.remove('active');
-
-      if (dom.player.currentTime === dom.player.duration) {
-        pause();
-      } else if (!isPaused) {
-        dom.player.play();
-      }
-    }
-
-    function mousemoveHandler(event) {
-      var pos = position(event);
-      var percent = pos * 100 + '%';
-      dom.playHead.classList.add('active');
-      dom.playHead.style.left = percent;
-      dom.elapsedTime.style.width = percent;
-      dom.player.currentTime = dom.player.duration * pos;
-      dom.elapsedText.textContent = formatDuration(dom.player.currentTime);
-    }
-
-    mousemoveHandler(e);
+    dom.player.currentTime = 0;
+    pause();
   }
 
-  function formatDuration(duration) {
-    function padLeft(num, length) {
-      var r = String(num);
-      while (r.length < length) {
-        r = '0' + r;
-      }
-      return r;
+  function updateSlider() {
+    var percent = (dom.player.currentTime / dom.player.duration) * 100;
+    if (isNaN(percent)) // this happens when we end the activity
+      return;
+    percent += '%';
+
+    dom.elapsedText.textContent = MediaUtils.formatDuration(
+      dom.player.currentTime);
+    dom.elapsedTime.style.width = percent;
+    // Don't move the play head if the user is dragging it.
+    if (!dragging)
+      dom.playHead.style.left = percent;
+  }
+
+  function handleSliderTouchEnd(event) {
+    // We don't care the event not related to touchStartID
+    if (!event.changedTouches.identifiedTouch(touchStartID)) {
+      return;
+    }
+    touchStartID = null;
+
+    if (!dragging) {
+      // We don't need to do anything without dragging.
+      return;
     }
 
-    var minutes = Math.floor(duration / 60);
-    var seconds = Math.round(duration % 60);
-    if (minutes < 60) {
-      return padLeft(minutes, 2) + ':' + padLeft(seconds, 2);
+    dragging = false;
+
+    dom.playHead.classList.remove('active');
+
+    if (dom.player.currentTime === dom.player.duration) {
+      pause();
+    } else if (!isPausedWhileDragging) {
+      dom.player.play();
     }
-    return '';
+  }
+
+  function handleSliderTouchMove(event) {
+    if (!dragging) {
+      return;
+    }
+
+    var touch = event.changedTouches.identifiedTouch(touchStartID);
+    // We don't care the event not related to touchStartID
+    if (!touch) {
+      return;
+    }
+
+    var pos = (touch.clientX - sliderRect.left) / sliderRect.width;
+    pos = Math.max(pos, 0);
+    pos = Math.min(pos, 1);
+
+    var percent = pos * 100 + '%';
+    dom.playHead.classList.add('active');
+    dom.playHead.style.left = percent;
+    dom.elapsedTime.style.width = percent;
+    dom.player.currentTime = dom.player.duration * pos;
+    dom.elapsedText.textContent = MediaUtils.formatDuration(
+      dom.player.currentTime);
   }
 
   function showBanner(msg) {
@@ -389,5 +451,15 @@ navigator.mozSetMessageHandler('activity', function viewVideo(activity) {
     if (!filename)
       return '';
     return filename.substring(filename.lastIndexOf('/') + 1);
+  }
+
+  function showSpinner() {
+    if (!blob) {
+      dom.spinnerOverlay.classList.remove('hidden');
+    }
+  }
+
+  function hideSpinner() {
+    dom.spinnerOverlay.classList.add('hidden');
   }
 });

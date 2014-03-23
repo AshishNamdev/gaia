@@ -1,4 +1,5 @@
 Calendar.ns('Views').Week = (function() {
+  'use strict';
 
   var Parent = Calendar.Views.Day;
   var template = Calendar.Templates.Week;
@@ -97,6 +98,17 @@ Calendar.ns('Views').Week = (function() {
       this.timespan = null;
       this.children = null;
       this.element = null;
+    },
+
+    getScrollTop: function() {
+      var scroll = this.element.querySelector('.scroll');
+      var scrollTop = scroll.scrollTop;
+      return scrollTop;
+    },
+
+    setScrollTop: function(scrollTop) {
+      var scroll = this.element.querySelector('.scroll');
+      scroll.scrollTop = scrollTop;
     },
 
     _appendSidebarHours: function() {

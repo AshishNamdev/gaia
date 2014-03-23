@@ -1,8 +1,44 @@
 
 /**
- * Make our TCPSocket implementation look like node's net library.
+ * Remoted network API that tries to look like node.js's "net" API.  We are
+ * expected/required to run in a worker thread where we don't have direct
+ * access to mozTCPSocket so everything has to get remitted to the main thread.
+ * Our counterpart is mailapi/worker-support/net-main.js
  *
- * We make sure to support:
+ *
+ * ## Sending lots of data: flow control, Blobs ##
+ *
+ * mozTCPSocket provides a flow-control mechanism (the return value to send
+ * indicates whether we've crossed a buffering boundary and 'ondrain' tells us
+ * when all buffered data has been sent), but does not yet support enqueueing
+ * Blobs for processing (which is part of the proposed standard at
+ * http://www.w3.org/2012/sysapps/raw-sockets/).  Also, the raw-sockets spec
+ * calls for generating the 'drain' event once our buffered amount goes back
+ * under the internal buffer target rather than waiting for it to hit zero like
+ * mozTCPSocket.
+ *
+ * Our main desire right now for flow-control is to avoid using a lot of memory
+ * and getting killed by the OOM-killer.  As such, flow control is not important
+ * to us if we're just sending something that we're already keeping in memory.
+ * The things that will kill us are giant things like attachments (or message
+ * bodies we are quoting/repeating, potentially) that we are keeping as Blobs.
+ *
+ * As such, rather than echoing the flow-control mechanisms over to this worker
+ * context, we just allow ourselves to write() a Blob and have the net-main.js
+ * side take care of streaming the Blobs over the network.
+ *
+ * Note that successfully sending a lot of data may entail holding a wake-lock
+ * to avoid having the network device we are using turned off in the middle of
+ * our sending.  The network-connection abstraction is not currently directly
+ * involved with the wake-lock management, but I could see it needing to beef up
+ * its error inference in terms of timeouts/detecting disconnections so we can
+ * avoid grabbing a wi-fi wake-lock, having our connection quietly die, and then
+ * we keep holding the wi-fi wake-lock for much longer than we should.
+ *
+ * ## Supported API Surface ##
+ *
+ * We make sure to expose the following subset of the node.js API because we
+ * have consumers that get upset if these do not exist:
  *
  * Attributes:
  * - encrypted (false, this is not the tls byproduct)
@@ -45,7 +81,13 @@ function NetSocket(port, host, crypto) {
   this._sendMessage = routerInfo.sendMessage;
   this._unregisterWithRouter = routerInfo.unregister;
 
-  var args = [host, port, { useSSL: crypto, binaryType: 'arraybuffer' }];
+  var args = [host, port,
+              {
+                // Bug 784816 is changing useSSL into useSecureTransport for
+                // spec compliance.  Use both during the transition period.
+                useSSL: crypto, useSecureTransport: crypto,
+                binaryType: 'arraybuffer'
+              }];
   this._sendMessage('open', args);
 
   EventEmitter.call(this);
@@ -58,8 +100,43 @@ NetSocket.prototype.setTimeout = function() {
 };
 NetSocket.prototype.setKeepAlive = function(shouldKeepAlive) {
 };
-NetSocket.prototype.write = function(buffer) {
-  this._sendMessage('write', [buffer.buffer, buffer.byteOffset, buffer.length]);
+// The semantics of node.js's socket.write does not take ownership and that's
+// how our code uses it, so we can't use transferrables by default.  However,
+// there is an optimization we want to perform related to Uint8Array.subarray().
+//
+// All the subarray does is create a view on the underlying buffer.  This is
+// important and notable because the structured clone implementation for typed
+// arrays and array buffers is *not* clever; it just serializes the entire
+// underlying buffer and the typed array as a view on that.  (This does have
+// the upside that you can transfer a whole bunch of typed arrays and only one
+// copy of the buffer.)  The good news is that ArrayBuffer.slice() does create
+// an entirely new copy of the buffer, so that works with our semantics and we
+// can use that to transfer only what needs to be transferred.
+NetSocket.prototype.write = function(u8array) {
+  if (u8array instanceof Blob) {
+    // We always send blobs in their entirety; you should slice the blob and
+    // give us that if that's what you want.
+    this._sendMessage('write', [u8array]);
+    return;
+  }
+
+  var sendArgs;
+  // Slice the underlying buffer and transfer it if the array is a subarray
+  if (u8array.byteOffset !== 0 ||
+      u8array.length !== u8array.buffer.byteLength) {
+    var buf = u8array.buffer.slice(u8array.byteOffset,
+                                   u8array.byteOffset + u8array.length);
+    this._sendMessage('write',
+                      [buf, 0, buf.byteLength],
+                      [buf]);
+  }
+  else {
+    this._sendMessage('write',
+                      [u8array.buffer, u8array.byteOffset, u8array.length]);
+  }
+};
+NetSocket.prototype.upgradeToSecure = function() {
+  this._sendMessage('upgradeToSecure', []);
 };
 NetSocket.prototype.end = function() {
   if (this.destroyed)
@@ -84,8 +161,8 @@ NetSocket.prototype._onclose = function() {
   this.emit('end');
 };
 
-exports.connect = function(port, host) {
-  return new NetSocket(port, host, false);
+exports.connect = function(port, host, crypto) {
+  return new NetSocket(port, host, !!crypto);
 };
 
 }); // end define
@@ -122,19 +199,25 @@ var util = require('util'), $log = require('rdcommon/log'),
 var emptyFn = function() {}, CRLF = '\r\n',
     CRLF_BUFFER = Buffer(CRLF),
     STATES = {
-      NOCONNECT: 0,
-      NOAUTH: 1,
-      AUTH: 2,
-      BOXSELECTING: 3,
-      BOXSELECTED: 4
+      NOCONNECT: 0, // not connected yet
+      NOGREET: 1, // waiting for a greeting / anything from the server
+      NOAUTH: 2, // not yet authenticated
+      AUTH: 3, // authenticated but we're not currently "in" a folder
+      BOXSELECTING: 4, // authenticated, trying to select/examine a folder
+      BOXSELECTED: 5 // authetnciated, successfully selected/examined a folder
     }, BOX_ATTRIBS = ['NOINFERIORS', 'NOSELECT', 'MARKED', 'UNMARKED'],
     MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep',
               'Oct', 'Nov', 'Dec'],
-    reFetch = /^\* (\d+) FETCH [\s\S]+? \{(\d+)\}$/,
+    // Check if this line is the start of a fetch line
+    reFetchStart = /^\* (\d+) FETCH/,
+    // Check if the string ends with a literal (not multi-line!)
+    reEndsWithLiteral = / \{(\d+)}$/,
+    reBodyFetch = /BODY\[(.*)\](?:\<\d+\>)?/,
     reUid = /UID (\d+)/,
-    reBodyPart = /BODY/,
-    reDate = /^(\d{2})-(.{3})-(\d{4})$/,
-    reDateTime = /^(\d{2})-(.{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2}) ([+-]\d{4})$/,
+    // ( ?\d|\d{2}) = day number; technically it's either "SP DIGIT" or "2DIGIT"
+    // but there's no harm in us accepting a single digit without whitespace;
+    // it's conceivable the caller might have trimmed whitespace.
+    reDateTime = /^( ?\d|\d{2})-(.{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2}) ([+-]\d{4})$/,
     HOUR_MILLIS = 60 * 60 * 1000, MINUTE_MILLIS = 60 * 1000;
 
 const CHARCODE_RBRACE = ('}').charCodeAt(0),
@@ -158,19 +241,6 @@ var gSendBuf = new Uint8Array(2000);
 
 function singleArgParseInt(x) {
   return parseInt(x, 10);
-}
-
-/**
- * Parses (UTC) IMAP dates into UTC timestamps. IMAP dates are DD-Mon-YYYY.
- */
-function parseImapDate(dstr) {
-  var match = reDate.exec(dstr);
-  if (!match)
-    throw new Error("Not a good IMAP date: " + dstr);
-  var day = parseInt(match[1], 10),
-      zeroMonth = MONTHS.indexOf(match[2]),
-      year = parseInt(match[3], 10);
-  return Date.UTC(year, zeroMonth, day);
 }
 
 /**
@@ -209,8 +279,23 @@ function decodeModifiedUtf7(encoded) {
 exports.decodeModifiedUtf7 = decodeModifiedUtf7;
 
 /**
- * Parses IMAP date-times into UTC timestamps.  IMAP date-times are
- * "DD-Mon-YYYY HH:MM:SS +ZZZZ"
+ * Parses IMAP "date-time" instances into UTC timestamps whose quotes have
+ * already been stripped.
+ *
+ * http://tools.ietf.org/html/rfc3501#page-84
+ *
+ * date-day        = 1*2DIGIT
+ *                    ; Day of month
+ * date-day-fixed  = (SP DIGIT) / 2DIGIT
+ *                    ; Fixed-format version of date-day
+ * date-month      = "Jan" / "Feb" / "Mar" / "Apr" / "May" / "Jun" /
+ *                   "Jul" / "Aug" / "Sep" / "Oct" / "Nov" / "Dec"
+ * date-year       = 4DIGIT
+ * time            = 2DIGIT ":" 2DIGIT ":" 2DIGIT
+ *                     ; Hours minutes seconds
+ * zone            = ("+" / "-") 4DIGIT
+ * date-time       = DQUOTE date-day-fixed "-" date-month "-" date-year
+ *                   SP time SP zone DQUOTE
  */
 function parseImapDateTime(dstr) {
   var match = reDateTime.exec(dstr);
@@ -237,6 +322,7 @@ function parseImapDateTime(dstr) {
 
   return timestamp;
 }
+exports.parseImapDateTime = parseImapDateTime;
 
 function formatImapDateTime(date) {
   var s;
@@ -278,13 +364,15 @@ function ImapConnection (options) {
     requests: [],
     unsentRequests: [],
     activeRequests: 0,
+    postGreetingCallback: null,
     numCapRecvs: 0,
-    isReady: false,
     isIdle: true,
-    tmrKeepalive: null,
-    tmoKeepalive: 10000,
     tmrConn: null,
     curData: null,
+    // The number of bytes that we should accumulate into curData before we try
+    // and process the current line (when we hit our next newline.)  This is
+    // used for our inline literal hacks for FETCH.
+    curDataMinLength: 0,
     // Because 0-length literals are a possibility, use null to represent no
     // expected data.
     curExpected: null,
@@ -320,12 +408,29 @@ function ImapConnection (options) {
   this.namespaces = { personal: [], other: [], shared: [] };
   this.capabilities = [];
   this.enabledCapabilities = [];
+  // The list of capabilities the server advertises that we want to ignore
+  // because they are broken on the server.  If blacklisting at runtime, use
+  // the blacklistCapability method.
+  this.blacklistedCapabilities = this._options.blacklistedCapabilities || [];
 };
 util.inherits(ImapConnection, EventEmitter);
 exports.ImapConnection = ImapConnection;
 
 ImapConnection.prototype.hasCapability = function(name) {
   return this.capabilities.indexOf(name) !== -1;
+};
+
+ImapConnection.prototype.blacklistCapability = function(name) {
+  var blacklist = this.blacklistedCapabilities;
+  name = up(name); // normalized to upper-case
+  // bail if already blacklisted
+  if (blacklist.indexOf(name) !== -1)
+    return;
+  blacklist.push(name);
+  // remove from known capabilities if present
+  var idx = this.capabilities.indexOf(name);
+  if (idx !== -1)
+    this.capabilities.splice(idx, 1);
 };
 
 ImapConnection.prototype._findAndShiftRequestByPrefix = function(prefix) {
@@ -377,9 +482,7 @@ ImapConnection.prototype._findFetchRequest = function(uid, bodyPart) {
 ImapConnection.prototype.connect = function(loginCb) {
   var self = this,
       fnInit = function() {
-        // First get pre-auth capabilities, including server-supported auth
-        // mechanisms
-        self._send('CAPABILITY', null, function() {
+        var attemptLogin = function() {
           // Next, attempt to login
           var checkedNS = false;
           var redo = function(err, reentry) {
@@ -400,14 +503,24 @@ ImapConnection.prototype.connect = function(loginCb) {
             self._send('LIST "" ""', null, loginCb);
           };
           self._login(redo);
-        });
+        };
+
+        // Get pre-auth capabilities, including server-supported auth mechanisms
+        // if we didn't hear them in the server greeting.
+        if (self._state.numCapRecvs === 0) {
+          self._send('CAPABILITY', null, attemptLogin);
+        }
+        else {
+          attemptLogin();
+        }
       };
   loginCb = loginCb || emptyFn;
   this._reset();
 
   if (this._LOG) this._LOG.connect(this._options.host, this._options.port);
 
-  this._state.conn = (this._options.crypto ? tls : net).connect(
+  this._state.conn = ((this._options.crypto === 'ssl' ||
+                       this._options.crypto === true) ? tls : net).connect(
                        this._options.port, this._options.host);
   this._state.tmrConn = setTimeoutFunc(this._fnTmrConn.bind(this, loginCb),
                                        this._options.connTimeout);
@@ -418,24 +531,33 @@ ImapConnection.prototype.connect = function(loginCb) {
       clearTimeoutFunc(self._state.tmrConn);
       self._state.tmrConn = null;
     }
-    self._state.status = STATES.NOAUTH;
-    /*
-    We will need to add support for node-like starttls emulation on top of TCPSocket
-    once TCPSocket supports starttls (see also bug 784816).
+    if (self._state.status === STATES.NOCONNECT) {
+      self._state.status = STATES.NOGREET;
+    }
+  });
 
+  this._state.postGreetingCallback = function() {
     if (self._options.crypto === 'starttls') {
-      self._send('STARTTLS', function() {
-        starttls(self, function() {
-	  if (!self.authorized)
-	    throw new Error("starttls failed");
-	  fnInit();
-        });
+      // we don't need to issue an explicit CAPABILITY request before issuing
+      // STARTTLS because it's game over if there is no STARTTLS.
+      // Coincidentally, we also want to ignore any insecure unsolicited
+      // CAPABILITY we got in the server greeting.
+      self._state.numCapRecvs = 0;
+      self._send('STARTTLS', null, function(err) {
+        if (err) {
+          var securityErr = new Error('Server does not support STARTTLS');
+          securityErr.type = 'bad-security';
+          loginCb(securityErr);
+        } else {
+          self._state.conn.upgradeToSecure();
+	        fnInit();
+        }
       });
       return;
     }
-    */
+
     fnInit();
-  });
+  };
 
   this._state.conn.on('data', function(buffer) {
     try {
@@ -456,20 +578,43 @@ ImapConnection.prototype.connect = function(loginCb) {
     var curReq = null;
     // -- Untagged server responses
     if (data[0] === '*') {
-      if (self._state.status === STATES.NOAUTH) {
-        if (data[1] === 'PREAUTH') { // the server pre-authenticated us
+      // We haven't heard anything from the server yet, this should be the
+      // greeting.
+      if (self._state.status === STATES.NOGREET) {
+        // The greeting is one of 3 things:
+        // - Pre-authentication indication, jump to being authenticated.
+        if (data[1] === 'PREAUTH') {
           self._state.status = STATES.AUTH;
-          if (self._state.numCapRecvs === 0)
+          if (self._state.numCapRecvs === 0) {
             self._state.numCapRecvs = 1;
+          }
+          return;
+        // - The server hates us, hang up.
         } else if (data[1] === 'NO' || data[1] === 'BAD' || data[1] === 'BYE') {
           if (self._LOG && data[1] === 'BAD')
             self._LOG.bad(data[2]);
           self._state.conn.end();
           return;
         }
-        if (!self._state.isReady)
-          self._state.isReady = true;
-        // Restrict the type of server responses when unauthenticated
+        // - The server is okay with us
+        // Check if we got an inline CAPABILITY like dovecot likes to do.
+        if (data[2].startsWith('[CAPABILITY ')) {
+          self._state.numCapRecvs = 1;
+          self.capabilities = data[2].substring(12, data[2].lastIndexOf(']'))
+                                     .split(' ').map(up);
+        }
+        // Advance to STARTTLS/CAPABILITY request
+        self._state.status = STATES.NOAUTH;
+        if (self._state.postGreetingCallback) {
+          var callback = self._state.postGreetingCallback;
+          self._state.postGreetingCallback = null;
+          callback();
+        }
+        return;
+      }
+      if (self._state.status === STATES.NOAUTH) {
+        // Since we explicitly break out the pre-greeting state now, this
+        // state really just exists to filter out weird unsolicited responses.
         if (data[1] !== 'CAPABILITY' && data[1] !== 'ALERT')
           return;
       }
@@ -663,7 +808,7 @@ ImapConnection.prototype.connect = function(loginCb) {
       }
 
       var sendBox = false;
-      clearTimeoutFunc(self._state.tmrKeepalive);
+
       if (self._state.status === STATES.BOXSELECTING) {
         if (data[1] === 'OK') {
           sendBox = true;
@@ -744,27 +889,9 @@ ImapConnection.prototype.connect = function(loginCb) {
 
       var recentCmd = recentReq.command;
       if (self._LOG) self._LOG.cmd_end(recentReq.prefix, recentCmd, /^LOGIN$/.test(recentCmd) ? '***BLEEPING OUT LOGON***' : recentReq.cmddata);
-      if (self._state.requests.length === 0
-          && recentCmd !== 'LOGOUT') {
-        if (self._state.status === STATES.BOXSELECTED &&
-            self.capabilities.indexOf('IDLE') > -1) {
-          // According to RFC 2177, we should re-IDLE at least every 29
-          // minutes to avoid disconnection by the server
-          self._send('IDLE', null, undefined, undefined, true);
-        }
-        self._state.tmrKeepalive = setTimeoutFunc(function() {
-          if (self._state.isIdle) {
-            if (self._state.ext.idle.state === IDLE_READY) {
-              self._state.ext.idle.timeWaited += self._state.tmoKeepalive;
-              if (self._state.ext.idle.timeWaited >= self._state.ext.idle.MAX_WAIT)
-                // restart IDLE
-                self._send('IDLE', null, undefined, undefined, true);
-            } else if (self.capabilities.indexOf('IDLE') === -1)
-              self._noop();
-          }
-        }, self._state.tmoKeepalive);
-      } else
+      if (self._state.requests.length !== 0 || recentCmd === 'LOGOUT') {
         process.nextTick(function() { self._send(); });
+      }
 
       self._state.isIdle = true;
     } else if (data[0] === 'IDLE') {
@@ -781,6 +908,41 @@ ImapConnection.prototype.connect = function(loginCb) {
   }
 
   /**
+   * Append the given data into _state.curData or set it if we don't have
+   * anything accumulated yet.  This process updates our CRLF scanning
+   * pointer so that anything buffered will not be re-checked for newlines.
+   *
+   * @param data {Buffer}
+   *   The data to append.
+   */
+  function bufferStateData(data) {
+    if (self._state.curData) {
+      self._state.curData = bufferAppend(self._state.curData, data);
+    }
+    else {
+      self._state.curData = data;
+    }
+    return self._state.curData;
+  }
+
+  /**
+   * Reset _state.curData and related variables.
+   *
+   * @param suggestedSize {Number}
+   *   The number of bytes expected; provide if known to avoid needless buffer
+   *   realloc'ing.
+   */
+  function resetStateData(suggestedSize) {
+    if (suggestedSize) {
+      self._state.curData = new Buffer(suggestedSize);
+    }
+    else {
+      self._state.curData = null;
+    }
+    self._state.curDataMinLength = 0;
+  }
+
+  /**
    * Process up to one thing.  Generally:
    * - If we are processing a literal, we make sure we have the data for the
    *   whole literal, then we process it.
@@ -792,155 +954,203 @@ ImapConnection.prototype.connect = function(loginCb) {
 
     // - Accumulate data until newlines when not in a literal
     if (self._state.curExpected === null) {
-      // no newline, append and bail
-      if ((idxCRLF = bufferIndexOfCRLF(data, 0)) === -1) {
-        if (self._state.curData)
-          self._state.curData = bufferAppend(self._state.curData, data);
-        else
-          self._state.curData = data;
+      var indexFrom = 0;
+      // If we have an inline literal requested then integrate it into our
+      // buffer, then let the newline logic come into play.
+      if (self._state.curDataMinLength) {
+        // not enough data, buffer and bail
+        if (self._state.curData.length + data.length <
+              self._state.curDataMinLength) {
+          bufferStateData(data);
+          return;
+        }
+        // enough data, do the CRLF check starting after the last byte of our
+        // data.
+        indexFrom = self._state.curDataMinLength - self._state.curData.length;
+        self._state.curDataMinLength = 0;
+      }
+
+      // Just buffer and bail if:
+      // * there's no newline (we want a newline)
+      // * there is a newline, but we're waiting for some minimal amount of data
+      //   and this doesn't put us over that threshold.
+      if ((idxCRLF = bufferIndexOfCRLF(data, indexFrom)) === -1) {
+        bufferStateData(data);
         return;
       }
-      // yes newline, use the buffered up data and new data
-      // (note: data may now contain more than one line's worth of data!)
-      if (self._state.curData && self._state.curData.length) {
-        data = bufferAppend(self._state.curData, data);
-        self._state.curData = null;
+      // Save everything after the newline off for the next call to this.  We
+      // used to keep that extra data around, but it creates permutations that
+      // require extra unit tests for no good reason.
+      if (data.length >= idxCRLF + 2) {
+        self._unprocessed.unshift(data.slice(idxCRLF + 2));
       }
+      data = data.slice(0, idxCRLF);
+      // And buffer/unify the buffer
+      data = bufferStateData(data);
+
+      // note: We are leaving all our data in self._state.curData, so consumers
+      // of the data need to call resetStateData() if they process the entirety
+      // of the line!
     }
 
     // -- Literal
     // Don't mess with incoming data if it's part of a literal
-    if (self._state.curExpected !== null) {
-      curReq = curReq || self._state.requests[0];
+    curReq = curReq || self._state.requests[0];
+    if (curReq && self._state.curExpected !== null) {
+      var chunk = data;
+      self._state.curXferred += data.length;
+      if (self._state.curXferred > self._state.curExpected) {
+        var pos = data.length
+              - (self._state.curXferred - self._state.curExpected),
+            extra = data.slice(pos);
 
-      if (!curReq._done) {
-        var chunk = data;
-        self._state.curXferred += data.length;
-        if (self._state.curXferred > self._state.curExpected) {
-          var pos = data.length
-                    - (self._state.curXferred - self._state.curExpected),
-              extra = data.slice(pos);
-          if (pos > 0)
-            chunk = data.slice(0, pos);
-          else
-            chunk = undefined;
-          data = extra;
-          curReq._done = 1;
+        if (pos > 0)
+          chunk = data.slice(0, pos);
+        else
+          chunk = undefined;
+        // It's not guaranteed that extra will actually have everything
+        // required to close out our processing, so we instead unprocess it
+        // if present, then just set _done on the req
+        if (extra.length) {
+          self._unprocessed.unshift(extra);
         }
+        curReq._done = 1;
+        self._state.curExpected = null;
+      }
 
-        if (chunk && chunk.length) {
-          if (self._LOG) self._LOG.data(chunk.length, chunk);
-          if (curReq._msgtype === 'headers') {
-            chunk.copy(self._state.curData, curReq.curPos, 0);
-            curReq.curPos += chunk.length;
-          }
-          else
-            curReq._msg.emit('data', chunk);
+      if (chunk && chunk.length) {
+        if (self._LOG) self._LOG.data(chunk.length, chunk);
+        if (curReq._msgtype === 'headers') {
+          chunk.copy(self._state.curData, curReq.curPos, 0);
+          curReq.curPos += chunk.length;
         }
+        else
+          curReq._msg.emit('data', chunk);
       }
 
       if (curReq._done) {
-        var restDesc;
-        if (curReq._done === 1) {
-          if (curReq._msgtype === 'headers')
-            curReq._headers = self._state.curData.toString('ascii');
-          self._state.curData = null;
-          curReq._done = true;
-        }
-
-        if (self._state.curData)
-          self._state.curData = bufferAppend(self._state.curData, data);
-        else
-          self._state.curData = data;
-
-        idxCRLF = bufferIndexOfCRLF(self._state.curData);
-        if (idxCRLF && self._state.curData[idxCRLF - 1] === CHARCODE_RPAREN) {
-          if (idxCRLF > 1) {
-            // eat up to, but not including, the right paren
-            restDesc = self._state.curData.toString('ascii', 0, idxCRLF - 1)
-                         .trim();
-            if (restDesc.length)
-              curReq._desc += ' ' + restDesc;
-          }
-          parseFetch(curReq._desc, curReq._headers, curReq._msg);
-          data = self._state.curData.slice(idxCRLF + 2);
-          curReq._done = false;
-          self._state.curXferred = 0;
-          self._state.curExpected = null;
-          self._state.curData = null;
-          curReq._msg.emit('end', curReq._msg);
-          // XXX we could just change the next else to not be an else, and then
-          // this conditional is not required and we can just fall out.  (The
-          // expected check === 0 may need to be reinstated, however.)
-          if (data.length && data[0] === CHARCODE_ASTERISK) {
-            self._unprocessed.unshift(data);
-            return;
-          }
-        } else // ??? no right-paren, keep accumulating data? this seems wrong.
-          return;
-      } else // not done, keep accumulating data
-        return;
+        // Save off the headers before we reset the state.
+        if (curReq._msgtype === 'headers')
+          curReq._headers = self._state.curData.toString('ascii');
+        resetStateData();
+      }
+      return;
     }
-    // -- Fetch w/literal
-    // (More specifically, we were not in a literal, let's see if this line is
-    // a fetch result line that starts a literal.  We want to minimize
-    // conversion to a string, as there used to be a naive conversion here that
-    // chewed up a lot of processor by converting all of data rather than
-    // just the current line.)
-    else if (data[0] === CHARCODE_ASTERISK) {
-      var strdata;
-      idxCRLF = bufferIndexOfCRLF(data, 0);
-      if (data[idxCRLF - 1] === CHARCODE_RBRACE &&
-          (literalInfo =
-             (strdata = data.toString('ascii', 0, idxCRLF)).match(reFetch))) {
-        self._state.curExpected = parseInt(literalInfo[2], 10);
+    // -- Done (post-literal)
+    if (curReq && curReq._done === 1) {
+      var restDesc;
 
-        var desc = strdata.substring(strdata.indexOf('(')+1).trim();
-        var type = /BODY\[(.*)\](?:\<\d+\>)?/.exec(strdata)[1];
-        var uid = reUid.exec(desc)[1];
-
-        // figure out which request this belongs to. If its not assigned to a
-        // specific uid then send it to the first pending request...
-        curReq = self._findFetchRequest(uid, type) || self._state.requests[0];
-        var msg = new ImapMessage();
-
-        // because we push data onto the unprocessed queue for any literals and
-        // processData lacks any context, we need to reorder the request to be
-        // first if it is not already first.  (Storing the request along-side
-        // the data in insufficient because if the literal data is fragmented
-        // at all, the context will be lost.)
-        if (self._state.requests[0] !== curReq) {
-          self._state.requests.splice(self._state.requests.indexOf(curReq), 1);
-          self._state.requests.unshift(curReq);
+      if (data[data.length - 1] === CHARCODE_RPAREN) {
+        // eat up to, but not including, the right paren
+        restDesc = data.toString('ascii', 0, data.length - 1).trim();
+        if (restDesc.length) {
+          curReq._desc += ' ' + restDesc;
         }
 
-        msg.seqno = parseInt(literalInfo[1], 10);
-        curReq._desc = desc;
-        curReq._msg = msg;
-        msg.size = self._state.curExpected;
+        parseFetch(curReq._desc, curReq._headers, curReq._msg);
+        curReq._done = false;
+        self._state.curXferred = 0;
+        self._state.curExpected = null;
+        resetStateData();
+        curReq._msg.emit('end', curReq._msg);
+      }
+      return;
+    }
 
-        curReq._fetcher.emit('message', msg);
+    // -- Check for fetch w/literal
+    // The general idea here is that if we see a line that ends with a CRLF
+    // (known if we are at this point) and starts with an asterisk, then we can
+    // make one of four decisions about what we're looking at:
+    // 1) This line is a FETCH result line with a literal that is the
+    //    'payload' of the FETCH.  Either a list of headers or the BODY.
+    //    We currently do not support a fetch that returns more than one
+    //    payload.  This code will be discarded before that ever happens.
+    // 2) This line is a FETCH result line with an inline literal that
+    //    is part of the response.  We want to make sure that we fetch the
+    //    literal and then resume processing so that we can handle more of
+    //    this case #2 or our termination case of #1.
+    // 3) This line is a FETCH result line with no literals and we want to
+    //    leave this up to processResponse to handle.
+    // 4) This line is some other result that we want processResponse to
+    //    handle.
+    //
+    // In this case we only need to handle #1 and #2
+    else if (data[0] === CHARCODE_ASTERISK &&
+             // regexps need strings!
+             (strdata = data.toString('ascii')) &&
+             reFetchStart.test(strdata) &&
+             (literalInfo = reEndsWithLiteral.exec(strdata))) {
+      var strdata; // this gets hoisted so our use above works, but is evil.
+      var literalLength = parseInt(literalInfo[1], 10);
 
-        curReq._msgtype = (type.indexOf('HEADER') === 0 ? 'headers' : 'body');
-        // This library buffers headers, so allocate a buffer to hold the literal.
-        if (curReq._msgtype === 'headers') {
-          self._state.curData = new Buffer(self._state.curExpected);
-          curReq.curPos = 0;
-        }
-        if (self._LOG) self._LOG.data(strdata.length, strdata);
-        // (If it's not headers, then it's body, and we generate 'data' events.)
-        self._unprocessed.unshift(data.slice(idxCRLF + 2));
+      var bodyInfo = reBodyFetch.exec(data);
+      // - Case #2: inline literal
+      if (!bodyInfo) {
+        // We want to accumulate the literal into our buffer. So:
+        // Put a CRLF into our buffer; it has semantic meaning for parseExpr but
+        // we stripped it off of data before.  (We could elide it, but then
+        // debugging would end up more confusing as our log output would be
+        // misleading.)
+        data = bufferStateData(CRLF_BUFFER);
+        // Make sure that the buffer accumulation logic above does not call us
+        // again until we have received our requested data (and another CRLF
+        // pair)
+        self._state.curDataMinLength = data.length + literalLength;
         return;
       }
+
+      // - Case #1: body literal.
+
+      // At this point, the literal points to the FETCH body.
+      self._state.curExpected = literalLength;
+
+      var desc = strdata.substring(strdata.indexOf('(')+1).trim();
+      var type = bodyInfo[1];
+      var uid = reUid.exec(desc)[1];
+
+      // figure out which request this belongs to. If its not assigned to a
+      // specific uid then send it to the first pending request...
+      curReq = self._findFetchRequest(uid, type) || self._state.requests[0];
+      var msg = new ImapMessage();
+
+      // because we push data onto the unprocessed queue for any literals and
+      // processData lacks any context, we need to reorder the request to be
+      // first if it is not already first.  (Storing the request along-side
+      // the data in insufficient because if the literal data is fragmented
+      // at all, the context will be lost.)
+      if (self._state.requests[0] !== curReq) {
+        self._state.requests.splice(self._state.requests.indexOf(curReq), 1);
+        self._state.requests.unshift(curReq);
+      }
+
+      msg.seqno = parseInt(literalInfo[1], 10);
+      curReq._desc = desc;
+      curReq._msg = msg;
+      msg.size = self._state.curExpected;
+
+      curReq._fetcher.emit('message', msg);
+
+      curReq._msgtype = (type.indexOf('HEADER') === 0 ? 'headers' : 'body');
+      // Headers get accumulated into self._state.curData, so we want to
+      // allocate a buffer for that.  The body contents get directly emitted
+      // to consumers as 'data' events, so we don't need to resetStateData for
+      // that.
+      if (curReq._msgtype === 'headers') {
+        resetStateData(self._state.curExpected);
+        curReq.curPos = 0;
+      }
+      if (self._LOG) self._LOG.data(strdata.length, strdata);
+      return;
     }
 
-    if (data.length === 0)
+    // consume the data
+    resetStateData();
+
+    // no need to process zero-length buffers
+    if (!data.length)
       return;
 
-    data = customBufferSplitCRLF(data);
-    var response = data.shift().toString('ascii');
-    // queue the remaining buffer chunks up for processing at the head of the queue
-    self._unprocessed = data.concat(self._unprocessed);
+    var response = data.toString('ascii');
 
     if (self._LOG) self._LOG.data(response.length, response);
     processResponse(stringExplode(response, ' ', 3));
@@ -993,7 +1203,9 @@ ImapConnection.prototype.die = function() {
     this._state.conn.end();
   }
   this._reset();
-  this._LOG.__die();
+  if (this._LOG) {
+    this._LOG.__die();
+  }
 };
 
 ImapConnection.prototype.isAuthenticated = function() {
@@ -1138,6 +1350,10 @@ ImapConnection.prototype.delBox = function(name, cb) {
   this._send('DELETE', ' "' + escape(name) + '"', cb);
 };
 
+ImapConnection.prototype.noop = function(cb) {
+  this._send('NOOP', '', cb);
+};
+
 ImapConnection.prototype.renameBox = function(oldname, newname, cb) {
   cb = arguments[arguments.length-1];
   if (typeof oldname !== 'string' || oldname.length === 0)
@@ -1190,7 +1406,15 @@ ImapConnection.prototype.append = function(data, options, cb) {
     cmd += ' "' + formatImapDateTime(options.date) + '"';
   }
   cmd += ' {';
-  cmd += (Buffer.isBuffer(data) ? data.length : Buffer.byteLength(data));
+  if (data instanceof Blob) {
+    cmd += data.size;
+  }
+  else if (Buffer.isBuffer(data)) {
+    cmd += data.length;
+  }
+  else {
+    cmd += Buffer.byteLength(data);
+  }
   cmd += '}';
   var self = this, step = 1;
   this._send('APPEND', cmd, function(err) {
@@ -1225,7 +1449,15 @@ ImapConnection.prototype.multiappend = function(messages, cb) {
       cmd += ' "' + formatImapDateTime(options.date) + '"';
     }
     cmd += ' {';
-    cmd += (Buffer.isBuffer(data) ? data.length : Buffer.byteLength(data));
+    if (data instanceof Blob) {
+      cmd += data.size;
+    }
+    else if (Buffer.isBuffer(data)) {
+      cmd += data.length;
+    }
+    else {
+      cmd += Buffer.byteLength(data);
+    }
     cmd += '}';
   }
 
@@ -1546,16 +1778,14 @@ ImapConnection.prototype._login = function(cb) {
   }
 };
 ImapConnection.prototype._reset = function() {
-  if (this._state.tmrKeepalive)
-    clearTimeoutFunc(this._state.tmrKeepalive);
   if (this._state.tmrConn)
     clearTimeoutFunc(this._state.tmrConn);
   this._state.status = STATES.NOCONNECT;
   this._state.numCapRecvs = 0;
   this._state.requests = [];
   this._state.unsentRequests = [];
+  this._state.postGreetingCallback = null;
   this._state.isIdle = true;
-  this._state.isReady = false;
   this._state.ext.idle.state = IDLE_NONE;
   this._state.ext.idle.timeWaited = 0;
 
@@ -1575,10 +1805,6 @@ ImapConnection.prototype._resetBox = function() {
   this._state.box.name = null;
   this._state.box.messages.total = 0;
   this._state.box.messages.new = 0;
-};
-ImapConnection.prototype._noop = function() {
-  if (this._state.status >= STATES.AUTH)
-    this._send('NOOP', null);
 };
 // bypass=true means to not push a command.  This is used exclusively for the
 // auto-idle functionality.  IDLE happens automatically when nothing else is
@@ -1659,8 +1885,6 @@ ImapConnection.prototype._writeRequest = function(request, realRequest) {
       cmd = request.command,
       data = request.cmddata,
       dispatch = request.dispatch;
-
-  clearTimeoutFunc(this._state.tmrKeepalive);
 
   // If we are currently in IDLE, we need to exit it before we send the
   // actual command.  We mark it as a bypass so it does't mess with the
@@ -2279,6 +2503,7 @@ function parseExpr(o, result, start) {
   var inQuote = false, lastPos = start - 1, isTop = false;
   if (!result)
     result = new Array();
+
   if (typeof o === 'string') {
     var state = new Object();
     state.str = o;
@@ -2287,9 +2512,9 @@ function parseExpr(o, result, start) {
   }
   for (var i=start,len=o.str.length; i<len; ++i) {
     if (!inQuote) {
-      if (o.str[i] === '"')
+      if (o.str[i] === '"') {
         inQuote = true;
-      else if (o.str[i] === ' ' || o.str[i] === ')' || o.str[i] === ']') {
+      } else if (o.str[i] === ' ' || o.str[i] === ')' || o.str[i] === ']') {
         if (i - (lastPos+1) > 0)
           result.push(convStr(o.str.substring(lastPos+1, i)));
         if (o.str[i] === ')' || o.str[i] === ']')
@@ -2300,13 +2525,35 @@ function parseExpr(o, result, start) {
         i = parseExpr(o, innerResult, i+1);
         lastPos = i;
         result.push(innerResult);
+      } else if (o.str[i] === '{') {
+        // Not in node-imap: Parse out literals properly here.
+        var idxCRLF = o.str.indexOf('\r\n', i);
+        if (idxCRLF != -1) {
+          var match = /\{(\d+)\}\r\n/.exec(o.str.substring(i, idxCRLF + 2));
+          if (match) {
+            var count = parseInt(match[1], 10);
+            if (!isNaN(count)) {
+              result.push(convStr(o.str.substr(idxCRLF + 2, count)));
+              // Consume through the last byte of the literal.  Subtract off 1
+              // since when we i++ in the loop, we will then be pointing at the
+              // first byte after the literal, as desired.
+              // NOTE: literals do *not* need a CRLF after them even though
+              // protocol traces may make it look like they do; it just happens
+              // that most literal payloads end with a CRLF/newline!
+              i = (idxCRLF + 2 + count) - 1;
+              lastPos = i;
+            }
+          }
+        }
       }
     } else if (o.str[i] === '"' &&
                (o.str[i-1] &&
-                (o.str[i-1] !== '\\' || (o.str[i-2] && o.str[i-2] === '\\'))))
+                (o.str[i-1] !== '\\' || (o.str[i-2] && o.str[i-2] === '\\')))) {
       inQuote = false;
-    if (i+1 === len && len - (lastPos+1) > 0)
+    }
+    if (i+1 === len && len - (lastPos+1) > 0) {
       result.push(convStr(o.str.substring(lastPos+1)));
+    }
   }
   return (isTop ? result : start);
 }
@@ -2352,41 +2599,6 @@ function bufferAppend(buf1, buf2) {
   return newBuf;
 };
 
-/**
- * Split the contents of a buffer on CRLF pairs, retaining the CRLF's on all but
- * the first line. In other words, ret[1] through ret[ret.length-1] will have
- * CRLF's.  The last entry may or may not have a CRLF.  The last entry will have
- * a non-zero length.
- *
- * This logic is very specialized to its one caller...
- */
-function customBufferSplitCRLF(buf) {
-  var ret = [];
-  var effLen = buf.length - 1, start = 0;
-  for (var i = 0; i < effLen;) {
-    if (buf[i] === 13 && buf[i + 1] === 10) {
-      // do include the CRLF in the entry if this is not the first one.
-      if (ret.length) {
-        i += 2;
-        ret.push(buf.slice(start, i));
-      }
-      else {
-        ret.push(buf.slice(start, i));
-        i += 2;
-      }
-      start = i;
-    }
-    else {
-      i++;
-    }
-  }
-  if (!ret.length)
-    ret.push(buf);
-  else if (start < buf.length)
-    ret.push(buf.slice(start, buf.length));
-  return ret;
-}
-
 function bufferIndexOfCRLF(buf, start) {
   // It's a 2 character sequence, pointless to check the last character,
   // especially since it would introduce additional boundary checks.
@@ -2397,6 +2609,8 @@ function bufferIndexOfCRLF(buf, start) {
   }
   return -1;
 }
+
+exports.parseExpr = parseExpr; // for testing
 
 var LOGFAB = exports.LOGFAB = $log.register(module, {
   ImapProtoConn: {
@@ -2490,6 +2704,9 @@ function ImapProber(credentials, connInfo, _LOG) {
   this._conn.connect(this.onLoggedIn.bind(this));
   this._conn.on('error', this.onError.bind(this));
 
+  this.tzOffset = null;
+  this.blacklistedCapabilities = null;
+
   this.onresult = null;
   this.error = null;
   this.errorDetails = { server: connInfo.hostname };
@@ -2512,14 +2729,26 @@ ImapProber.prototype = {
     }
 
     console.log('PROBE:IMAP happy, TZ offset:', tzOffset / (60 * 60 * 1000));
-    this.error = null;
+    this.tzOffset = tzOffset;
+
+    exports.checkServerProblems(this._conn,
+                                this.onServerProblemsChecked.bind(this));
+  },
+
+  onServerProblemsChecked: function(err, blacklistedCapabilities) {
+    if (err) {
+      this.onError(err);
+      return;
+    }
+
+    this.blacklistedCapabilities = blacklistedCapabilities;
 
     var conn = this._conn;
     this._conn = null;
 
     if (!this.onresult)
       return;
-    this.onresult(this.error, conn, tzOffset);
+    this.onresult(this.error, conn, this.tzOffset, blacklistedCapabilities);
     this.onresult = false;
   },
 
@@ -2611,6 +2840,17 @@ var normalizeError = exports.normalizeError = function normalizeError(err) {
       else
         errName = 'bad-user-or-pass';
     }
+    break;
+  // It's an ill-behaved server that reports BAD on bad credentials; the fake
+  // IMAP server was doing this and has now been fixed.  However, it raises a
+  // good point that on login it's probably best if we interpret BAD as a
+  // credentials problem, at least until we start using other forms of
+  // authentication.
+  case 'BAD':
+  case 'bad':
+    errName = 'bad-user-or-pass';
+    reportProblem = true;
+    retry = false;
     break;
   case 'server-maintenance':
     errName = err.type;
@@ -2742,6 +2982,74 @@ var getTZOffset = exports.getTZOffset = function getTZOffset(conn, callback) {
   }
   var uidsTried = 0;
   conn.openBox('INBOX', true, gotInbox);
+};
+
+/**
+ * Check for server problems and determine if they are fatal or if we can work
+ * around them.  We run this as part of the probing step so we can avoid
+ * creating the account at all if it's not going to work.
+ *
+ * This is our hit-list:
+ *
+ * - Broken SPECIAL-USE implementation.  We detect this and work-around it by
+ *   blacklisting the SPECIAL-USE capability.  daum.net currently advertises
+ *   SPECIAL-USE but its implementation is deeply broken.  From
+ *   https://bugzilla.mozilla.org/show_bug.cgi?id=904022#c4 we have:
+ *   - SPECIAL-USE does not actually seem to be listing any defined special-use
+ *     flags
+ *   - Our RETURN (SPECIAL-USE) command seems to be displaying folders that are
+ *     hidden from the normal LIST command.  It seems like those folders should
+ *     still be listed under a straight up 'LIST "" "*"' command.
+ *   - The core bug here, 'LIST "" "*" RETURN (SPECIAL-USE)' is being
+ *     interpreted as 'LIST (SPECIAL-USE) "" "*"' where only folders with
+ *     SPECIAL-USE flags should be returned.  Of course, since no special use
+ *     flags are actually returned, that's still buggy.
+ *
+ * Other notes:
+ *
+ * - We haven't seen a broken XLIST implementation yet so we're not checking it.
+ *
+ * @param conn {ImapConnection}
+ * @param callback {Function(err, nullOrListOfBlacklistedCapabilities)}
+ */
+exports.checkServerProblems = function(conn, callback) {
+  // If there is no SPECIAL-USE capability, there is nothing for us to check.
+  if (!conn.hasCapability('SPECIAL-USE')) {
+    callback(null, null);
+  }
+
+  function hasInbox(boxesRoot) {
+    for (var boxName in boxesRoot) {
+      if (boxName.toLowerCase() === 'inbox') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Our success metric is that if our SPECIAL-USE LIST invocation returns the
+  // Inbox, then it's not broken.  This is the simplest and most straightforward
+  // test because RFC 3501 demands that Inbox exists at that path, avoiding
+  // namespace complications.  (The personal namespace can be rooted under
+  // INBOX, but INBOX is still exists and is chock full of messages.)
+  conn.getBoxes(function(err, boxesRoot) {
+    // No inbox?  Let's turn off SPECIAL-USE and see if we find the Inbox.
+    if (!hasInbox(boxesRoot)) {
+      conn.blacklistCapability('SPECIAL-USE');
+      conn.getBoxes(function(err, boxesRoot) {
+        // Blacklist if we found an inbox.
+        if (hasInbox(boxesRoot))
+          callback(null, ['SPECIAL-USE']);
+        // Fatally bad news.  Create a better IMAP error message and string if
+        // we ever encounter a server that we actually can't support at all.
+        else
+          callback('server-problem', null);
+      });
+      return;
+    }
+    // Found the inbox; the server is fine.  Hooray for good IMAP servers!
+    callback(null, null);
+  });
 };
 
 }); // end define

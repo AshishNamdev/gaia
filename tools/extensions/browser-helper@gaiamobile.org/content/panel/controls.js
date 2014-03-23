@@ -13,7 +13,7 @@ function sendChromeEvent(detail) {
 }
 
 function sendEvent(type, details) {
-  var event = tab.CustomEvent(type, details);
+  var event = new tab.CustomEvent(type, details);
   tab.dispatchEvent(event);
 }
 
@@ -40,36 +40,6 @@ function takeScreenshot() {
 }
 
 
-function HardwareButtons() {
-
-}
-
-HardwareButtons.prototype = {
-  home: function() {
-    hardware.wake();
-    sendEvent('home');
-  },
-  holdHome: function() {
-    sendEvent('holdhome');
-  },
-  volumeUp: function() {
-    sendEvent('volumeup');
-  },
-  volumeDown: function() {
-    sendEvent('volumedown');
-  },
-  sleep: function() {
-    sendEvent('sleep');
-  },
-  wake: function() {
-    sendEvent('wake');
-  },
-  holdSleep: function() {
-    sendEvent('holdsleep');
-  }
-};
-window.hardware = new HardwareButtons();
-
 function Emulation() {
 
 }
@@ -93,8 +63,10 @@ function Workflow() {
 
 Workflow.prototype = {
   reload: function() {
-    var wm = tab.wrappedJSObject.WindowManager
-    var app = wm.getRunningApps()[wm.getDisplayedApp()];
+    var global = tab.wrappedJSObject;
+    var wm = global.AppWindowManager;
+    var app = wm.getActiveApp();
+
     app.reload();
   },
 

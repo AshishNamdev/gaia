@@ -20,7 +20,8 @@ suite('GestureDetector', function() {
     });
   });
 
-  suite('gesture detection', function() {
+  // Disabled per bug: https://bugzilla.mozilla.org/show_bug.cgi?id=956591
+  suite.skip('gesture detection', function() {
     var gd, element, events;
 
     // Return the sequence of events as a string of event types
@@ -163,7 +164,7 @@ suite('GestureDetector', function() {
     });
 
     swipes.forEach(function(s) {
-      test('mouseswipe ' + s.name, function(done) {
+      test.skip('mouseswipe ' + s.name, function(done) {
         SyntheticGestures.mouseswipe(element, s.x0, s.y0, s.x1, s.y1,
                                      200, checkswipe);
         function checkswipe() {
@@ -205,6 +206,9 @@ suite('GestureDetector', function() {
     });
 
 */
+
+/**
+ * Insanely flakey too:
     if (touchDevice) {
       var pinches = [
         { x0: 0, y0: 0, x1: 100, y1: 100, scale: 2, duration: 800 },
@@ -262,7 +266,7 @@ suite('GestureDetector', function() {
         });
       });
     }
-
+*/
     // Reuse some of the swipes data for testing hold+move events.
     // The hold tests take about 1.5s each since they require > 1s
     // just to trigger the hold detection. So only do four of each

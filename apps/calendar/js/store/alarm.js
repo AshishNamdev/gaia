@@ -1,4 +1,5 @@
 Calendar.ns('Store').Alarm = (function() {
+  'use strict';
 
   var Calc = Calendar.Calc;
 
@@ -66,8 +67,9 @@ Calendar.ns('Store').Alarm = (function() {
      * Manage the queue when alarms are added.
      */
     _addDependents: function(obj, trans) {
-      if (!this.autoQueue)
+      if (!this.autoQueue) {
         return;
+      }
 
       // by using processQueue even if we added
       // 6000 alarms during a single transaction we only
@@ -256,11 +258,22 @@ Calendar.ns('Store').Alarm = (function() {
       //     to justify the perf cost here later.
       req.onsuccess = function(e) {
         var data = e.target.result;
+        var len = data.length;
+        var mozAlarm;
 
-        if (data.length <= 0) {
-          requiresAlarm = true;
+        requiresAlarm = true;
+
+        for (var i = 0; i < len; i++) {
+          mozAlarm = data[i].data;
+          if (
+            mozAlarm &&
+            'eventId' in mozAlarm &&
+            'trigger' in mozAlarm
+          ) {
+            requiresAlarm = false;
+            break;
+          }
         }
-
 
         callback = callback || function() {};
         self._moveAlarms(

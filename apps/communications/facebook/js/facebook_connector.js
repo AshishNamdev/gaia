@@ -20,15 +20,69 @@ if (!window.FacebookConnector) {
       return out;
     }
 
-    function persistFbData(data, successCb, errorCb) {
+    function persistFbData(data, successCb, errorCb, options) {
+      var saveCbs = {
+        success: function(e) {
+          if (options === 'not_match') {
+            successCb();
+            return;
+          }
+
+          var cbs = {
+            onmatch: function(matches) {
+              // For each of the matching contacts link with the just imported
+              Object.keys(matches).forEach(function(aMatchId) {
+                var fbContact = new
+                                  fb.Contact(matches[aMatchId].matchingContact);
+
+                var mozContReq = fb.utils.getMozContact(data.uid);
+
+                mozContReq.onsuccess = function() {
+                  var linkParams = {
+                    uid: data.uid,
+                    mozContact: mozContReq.result
+                  };
+                  if (Array.isArray(data.photo) && data.photo[0]) {
+                    linkParams.photoUrl = data.pic_big;
+                  }
+                  var req = fbContact.linkTo(linkParams);
+
+                  req.onsuccess = successCb;
+
+                  req.onerror = function error(e) {
+                    window.console.error('Error while automatically linking : ',
+                                         aMatchId, data.uid, e.target.name);
+                    successCb();
+                  };
+                };
+                mozContReq.onerror = function(e) {
+                  window.console.error(
+                    'Error getting mozContact data in automatic linking: ',
+                                       e.target.error.name);
+                  successCb();
+                };
+              });
+            },
+            onmismatch: successCb
+          };
+          // Try to match and if so merge is performed
+          contacts.Matcher.match(data, 'passive', cbs);
+        },
+        error: errorCb
+      };
+      saveFbContact(data, saveCbs.success, saveCbs.error);
+    }
+
+
+    function saveFbContact(data, successCb, errorCb) {
       var fbContact, successWrapperCb;
 
       if (reusedFbContact.ready) {
         reusedFbContact.ready = null;
         fbContact = reusedFbContact;
-        successWrapperCb = function onsuccess() {
+        successWrapperCb = function onsuccess(e) {
           reusedFbContact.ready = true;
-          successCb();
+          successCb(e);
         };
       } else {
         fbContact = new fb.Contact();
@@ -82,39 +136,34 @@ if (!window.FacebookConnector) {
 
     var friendsQueryStr = FRIENDS_QUERY.join('');
 
-    function contactDataLoaded(response) {
+    function contactDataLoaded(options, response) {
       if (!response.error) {
         // Just in case this is the first contact imported
         nextUpdateTime = Date.now();
         var photoTimeout = false;
+
+        var successCb = this.success;
 
         var friend = response.data[0];
         if (friend) {
           var out1 = self.adaptDataForShowing(friend);
           var photoCbs = {};
 
-          photoCbs.success = (function(blobPicture) {
-            if (blobPicture) {
-              out1.photo = [blobPicture];
+          photoCbs.success = function(blobPicture) {
+            if (!blobPicture) {
+              pictureLoaded(out1, options, successCb);
+              return;
             }
-
-            var success = this.success;
-            var data = self.adaptDataForSaving(out1);
-            persistFbData(data, function() {
-                                      success({
-                                        uid: friend.uid,
-                                        url: friend.pic_big
-                                      });
-                                }, this.error);
-
-            // If there is no an alarm set it has to be set
-            window.asyncStorage.getItem(fb.utils.ALARM_ID_KEY, function(data) {
-              if (!data) {
-                fb.utils.setLastUpdate(nextUpdateTime,
-                                       fb.sync.scheduleNextSync);
+            utils.thumbnailImage(blobPicture,
+                                 function gotThumbnail(thumbnail) {
+              if (blobPicture !== thumbnail) {
+                out1.photo = [blobPicture, thumbnail];
+              } else {
+                out1.photo = [blobPicture];
               }
+              pictureLoaded(out1, options, successCb);
             });
-          }).bind(this); // successCb
+          }; // successCb
 
           self.downloadContactPicture(friend, acc_tk, photoCbs);
         } // if friend
@@ -126,6 +175,24 @@ if (!window.FacebookConnector) {
       else {
         this.error(response.error);
       }
+    }
+
+    function pictureLoaded(friend, options, success) {
+      var data = self.adaptDataForSaving(friend);
+      persistFbData(data, function() {
+                                      success({
+                                        uid: friend.uid,
+                                        url: friend.pic_big
+                                      });
+                                }, this.error, options);
+
+      // If there is no an alarm set it has to be set
+      window.asyncStorage.getItem(fb.utils.ALARM_ID_KEY, function(data) {
+        if (!data) {
+          fb.utils.setLastUpdate(nextUpdateTime,
+                                 fb.sync.scheduleNextSync);
+        }
+      });
     }
 
     function FacebookConnector() { }
@@ -158,11 +225,11 @@ if (!window.FacebookConnector) {
       },
 
       // Imports a Contact to FB indexedDB private database
-      importContact: function(uid, access_token, callbacks) {
+      importContact: function(uid, access_token, callbacks, options) {
         acc_tk = access_token;
         var oneFriendQuery = buildFriendQuery(uid);
         var auxCallbacks = {
-          success: contactDataLoaded.bind(callbacks),
+          success: contactDataLoaded.bind(callbacks, options),
           error: callbacks.error,
           timeout: callbacks.timeout
         };
@@ -208,7 +275,7 @@ if (!window.FacebookConnector) {
 
       adaptDataForSaving: function fbAdapt(cfdata) {
         var worksAt = fb.getWorksAt(cfdata);
-        var address = fb.getAddress(cfdata);
+        var address = fb.getAddresses(cfdata);
 
         var birthDate = null;
         if (cfdata.birthday_date && cfdata.birthday_date.length > 0) {
@@ -221,7 +288,7 @@ if (!window.FacebookConnector) {
         };
 
         if (address) {
-          fbInfo.adr = [address];
+          fbInfo.adr = address;
         }
 
         // This is the short telephone number to enable indexing
@@ -263,15 +330,8 @@ if (!window.FacebookConnector) {
       },
 
       downloadContactPicture: function(contact, access_token, callbacks) {
-        return fb.utils.getFriendPicture(contact.uid,
-          function(blobPicture) {
-            if (blobPicture) {
-              callbacks.success(blobPicture);
-            }
-            else {
-              callbacks.timeout();
-            }
-          }, access_token, importUtils.getPreferredPictureDetail());
+        return fb.utils.getFriendPicture(contact.uid, callbacks.success,
+                        access_token, importUtils.getPreferredPictureDetail());
       },
 
       oncontactsloaded: function(lfriends) {
@@ -284,6 +344,7 @@ if (!window.FacebookConnector) {
 
       oncontactsimported: function(existingContacts, friendsImported, cb) {
         setInfraForSync(existingContacts, friendsImported, cb);
+        fb.contacts.flush();
       },
 
       startSync: function(existingContacts, myFriendsByUid, syncFinished) {

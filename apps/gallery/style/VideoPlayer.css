@@ -49,7 +49,6 @@
   overflow: hidden;
   opacity: 1;
   transition: opacity 0.5s;
-  font-family: "MozTT", sans-serif;
   -moz-user-select: none;
 }
 
@@ -64,7 +63,7 @@
   height: 10rem;
   padding: 0;
   margin: 0;
-  background: url("images/video_pause_button.png") no-repeat center center / 9.6rem,
+  background: url("images/video_pause_button.png") no-repeat center center / 3rem,
               rgba(0,0,0,.5);
   border-radius: 5.3rem;
   border: solid #ccc 0.3rem;
@@ -73,7 +72,7 @@
 }
 
 .videoPlayerPauseButton:active {
-  background: url("images/video_pause_button.png") no-repeat center center / 9.6rem,
+  background: url("images/video_pause_button.png") no-repeat center center / 3rem,
               url("images/video_play_focus.png") no-repeat center center / 10.6rem;
 }
 
@@ -125,7 +124,7 @@ button::-moz-focus-inner {
 
 .videoPlayerElapsedBar, .videoPlayerBackgroundBar {
   height: 0.4rem;
-  width: 0%;
+  width: 0;
   top: 50%;
   margin-top: -0.2rem;
   border-radius: 0.6rem;
@@ -150,3 +149,21 @@ button::-moz-focus-inner {
   margin: -1rem 0 0 -1.2rem;
 }
 
+
+.videoPlayerFullscreenButton {
+  position: absolute;
+  display: none;
+  border: none;
+  width: 8rem;
+  height: 8rem;
+  padding: 3.4rem;
+  margin: 0;
+  background: url("images/fullscreen.png") no-repeat center center / 4.6rem,
+              transparent;
+  right: 0;
+}
+
+.videoPlayerFullscreenButton:active {
+  background: url("images/fullscreen_pressed.png") no-repeat center center / 4.6rem,
+              transparent;
+}

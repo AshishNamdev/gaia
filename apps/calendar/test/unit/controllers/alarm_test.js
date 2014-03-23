@@ -2,7 +2,6 @@ requireApp('calendar/shared/js/notification_helper.js');
 requireLib('notification.js');
 
 suiteGroup('Controllers.Alarm', function() {
-
   function mockRequestWakeLock(handler) {
     var realApi;
 
@@ -45,7 +44,6 @@ suiteGroup('Controllers.Alarm', function() {
   var settingStore;
 
   setup(function(done) {
-    this.timeout(10000);
     app = testSupport.calendar.app();
     db = app.db;
     subject = new Calendar.Controllers.Alarm(app);
@@ -235,6 +233,7 @@ suiteGroup('Controllers.Alarm', function() {
       var event;
       var alarm;
       var transPending = 0;
+      var worksQueue;
 
       function createTrans(done) {
         var trans = eventStore.db.transaction(
@@ -262,11 +261,18 @@ suiteGroup('Controllers.Alarm', function() {
 
       setup(function() {
         lock = null;
+        worksQueue = false;
         subject.observe();
         transPending = 0;
         sent.length = 0;
         event = null;
         busytime = null;
+
+        alarmStore.workQueue = function() {
+          worksQueue = true;
+          var callback = Array.slice(arguments).pop();
+          Calendar.nextTick(callback);
+        };
 
         subject._sendAlarmNotification = function() {
           sent.push(arguments);
@@ -313,30 +319,31 @@ suiteGroup('Controllers.Alarm', function() {
         });
 
         test('result', function(done) {
-          var trans = createTrans(function() {
-            done(function() {
-              assert.length(sent, 0);
-              assert.ok(lock.mIsUnlocked, 'frees lock');
+          subject.handleAlarm(alarm, function() {
+            Calendar.nextTick(function() {
+              done(function() {
+                assert.length(sent, 0);
+                assert.ok(lock.mIsUnlocked, 'frees lock');
+                assert.ok(worksQueue, 'works alarm queue');
+              });
             });
           });
-          subject.handleAlarm(alarm, trans);
           assert.ok(lock.mAquired, 'aquired lock');
         });
       });
 
       test('missing records', function(done) {
-        var trans = createTrans(function() {
-          done(function() {
-            assert.equal(sent.length, 0);
-          });
-        });
-
         alarm = {
           eventId: 12,
           busytimeId: 12
         };
 
-        subject.handleAlarm(alarm, trans);
+        subject.handleAlarm(alarm, function() {
+          done(function() {
+            assert.equal(sent.length, 0);
+            assert.ok(worksQueue, 'works alarm queue');
+          });
+        });
       });
 
       suite('valid busytime', function() {
@@ -369,25 +376,20 @@ suiteGroup('Controllers.Alarm', function() {
             );
 
             var cb = sent[sent.length - 1];
-
             cb();
-
-            assert.isTrue(
-              lock.mIsUnlocked,
-              'lock is freed after notification is ready'
-            );
-
             isComplete = true;
           };
 
-          var trans = createTrans(function() {
-            done(function() {
-              assert.ok(isComplete);
-              assert.deepEqual(sent[0], alarm);
-              assert.ok(lock.mIsUnlocked, 'frees lock');
+          subject.handleAlarm(alarm, function() {
+            Calendar.nextTick(function() {
+              done(function() {
+                assert.ok(isComplete);
+                assert.deepEqual(sent[0], alarm);
+                assert.ok(worksQueue, 'works alarm queue');
+                assert.ok(lock.mIsUnlocked, 'frees lock');
+              });
             });
           });
-          subject.handleAlarm(alarm, trans);
 
           assert.ok(lock.mAquired, 'aquired lock');
         });

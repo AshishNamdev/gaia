@@ -11,6 +11,7 @@
   border: solid 0.1rem #adadad;
   border-right: none;
   border-left: none;
+  border-bottom: none;
 }
 
 #datausage-tab .toggle-data li {
@@ -25,7 +26,7 @@
 
 #datausage-tab .toggle-data li p:only-child,
 #datausage-tab .toggle-data li p:first-of-type:last-of-type {
-  line-height: 1.8rem;
+  line-height: 2rem;
 }
 
 #datausage-tab .toggle-data li p strong {
@@ -39,7 +40,7 @@
   border: none;
 }
 
-#datausage-tab .toggle-data li label span {
+#datausage-tab .toggle-data li label span:after {
   right: 0;
   left: auto;
 }
@@ -54,7 +55,7 @@
   border: solid 0.1rem #979797;
   left: 0.5rem;
   top: 50%;
-  margin: -0.95rem 0 0;
+  margin: -0.9rem 0 0;
   transition: background 0.2s ease;
 }
 

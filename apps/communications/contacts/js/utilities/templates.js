@@ -64,6 +64,9 @@ if (!utils.templates) {
         var out;
         if (property.indexOf('.') === -1) {
           out = data[property];
+          if (Array.isArray(out) && out.length > 0) {
+            out = out[0];
+          }
         } else {
             throw new Error('Dotted expressions not supported');
         }
@@ -72,7 +75,7 @@ if (!utils.templates) {
           out = text;
         }
         return out;
-      }
+      };
     }
 
     /**
@@ -128,7 +131,7 @@ if (!utils.templates) {
              target.appendChild(newElem);
           } else if (mode === 'P') { // Append mode
             if (target.firstChild) {
-              target.insertBefore(newElem, ele.firstChild);
+              target.insertBefore(newElem, element.firstChild);
             } else {
               target.appendChild(newElem);
             }
@@ -136,7 +139,7 @@ if (!utils.templates) {
 
         } // if template
 
-      }.bind(this)); // forEach data
+      }.bind(Templates)); // forEach data
 
       return newElem;
     }

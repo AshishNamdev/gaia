@@ -6,7 +6,8 @@ if (!utils.sdcard) {
   var SdCard = utils.sdcard = {
     NOT_INITIALIZED: 0,
     NOT_AVAILABLE: 1,
-    AVAILABLE: 2
+    AVAILABLE: 2,
+    observers: {}
   };
 
   SdCard.status = SdCard.NOT_INITIALIZED;
@@ -15,25 +16,35 @@ if (!utils.sdcard) {
   SdCard.updateStorageState = function sd_updateStorageState(state) {
     switch (state) {
       case 'available':
-      case 'shared':
         SdCard.status = SdCard.AVAILABLE;
         break;
+      // Making the 'shared' state as NOT_AVAILABLE since we
+      // could have inconsistencies if we allow changing the sdcard
+      // content meanwhile exporting/importing
+      case 'shared':
       case 'unavailable':
       case 'deleted':
         SdCard.status = SdCard.NOT_AVAILABLE;
         break;
     }
+    Object.keys(this.observers).forEach(function onObserver(name) {
+      if (typeof(SdCard.observers[name]) === 'function') {
+        SdCard.observers[name].call(null, state);
+      }
+    });
   };
 
-  SdCard.deviceStorage
-    .addEventListener('change', function sd_deviceStorageChangeHandler(e) {
-      SdCard.updateStorageState(e.reason);
-    });
+  if (SdCard.deviceStorage) {
+    SdCard.deviceStorage
+      .addEventListener('change', function sd_deviceStorageChangeHandler(e) {
+        SdCard.updateStorageState(e.reason);
+      });
 
-  if (SdCard.status === SdCard.NOT_INITIALIZED) {
-    SdCard.deviceStorage.available().onsuccess = (function(e) {
-      SdCard.updateStorageState(e.target.result);
-    });
+    if (SdCard.status === SdCard.NOT_INITIALIZED) {
+      SdCard.deviceStorage.available().onsuccess = (function(e) {
+        SdCard.updateStorageState(e.target.result);
+      });
+    }
   }
 
   /**
@@ -86,8 +97,9 @@ if (!utils.sdcard) {
    */
   SdCard.getTextFromFiles = function(fileArray, contents, cb) {
     contents = contents || '';
-    if (!fileArray || !fileArray.length)
+    if (!fileArray || !fileArray.length) {
       return cb && cb(null, contents);
+    }
 
     var reader = new FileReader();
     reader.onload = function onloaded() {
@@ -101,6 +113,32 @@ if (!utils.sdcard) {
     catch (ex) {
       window.console.error('Problem reading file: ', ex.stack);
       SdCard.getTextFromFiles(fileArray, contents, cb);
+    }
+  };
+
+  // Subscribe a callback for sdcard changes. A name is needed
+  // to refer to this observer.
+  // @param {String} identifier for the observer
+  // @param {Function} the callback to be invoqued on a change
+  // @param {Boolean} if the callback exists, override it
+  SdCard.subscribeToChanges = function(name, func, force) {
+    if (this.observers[name] !== undefined && !force) {
+      return false;
+    }
+
+    this.observers[name] = func;
+    return true;
+  };
+
+  // Remove the subscription to listen to changes for the specific
+  // identifier
+  // @param {String} the identifier
+  SdCard.unsubscribeToChanges = function(name) {
+    if (this.observers[name]) {
+      delete this.observers[name];
+      return true;
+    } else {
+      return false;
     }
   };
 }

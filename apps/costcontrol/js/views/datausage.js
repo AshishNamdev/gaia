@@ -1,3 +1,6 @@
+/* global _, ConfigManager, CostControl, checkDataUsageNotification,
+          debug, toMidnight, formatData, roundData, smartRound */
+/* jshint -W120 */
 
 /*
  * The data usage tab is in charge of usage charts of mobile and wi-fi networks.
@@ -20,6 +23,12 @@ var DataUsageTab = (function() {
   var wifiItem, mobileItem;
 
   var costcontrol, initialized, model;
+
+  var DEVICE_RATIO = window.devicePixelRatio || 1;
+  function toDevicePixels(origin) {
+     return origin * DEVICE_RATIO;
+  }
+
   function setupTab() {
     if (initialized) {
       return;
@@ -45,20 +54,23 @@ var DataUsageTab = (function() {
       window.addEventListener('localized', localize);
 
       // Update and chart visibility
-      document.addEventListener('mozvisibilitychange', updateWhenVisible);
+      document.addEventListener('visibilitychange', updateWhenVisible);
       wifiToggle.addEventListener('click', toggleWifi);
       mobileToggle.addEventListener('click', toggleMobile);
 
+      resetButtonState();
+
       // Setup the model
-      ConfigManager.requestSettings(function _onSettings(settings) {
+      ConfigManager.requestSettings(Common.dataSimIccId,
+                                    function _onSettings(settings) {
         debug('First time setup for model');
-        var lastDataReset = settings.lastDataReset;
+        var lastCompleteDataReset = settings.lastCompleteDataReset;
         var nextReset = settings.nextReset;
         model = {
-          height: graphicArea.clientHeight,
-          width: graphicArea.clientWidth,
-          originX: Math.floor(graphicArea.clientWidth * 0.15),
-          endX: Math.floor(graphicArea.clientWidth * 0.95),
+          height: toDevicePixels(graphicArea.clientHeight),
+          width: toDevicePixels(graphicArea.clientWidth),
+          originX: Math.floor(toDevicePixels(graphicArea.clientWidth) * 0.15),
+          endX: Math.floor(toDevicePixels(graphicArea.clientWidth) * 0.95),
           axis: {
             Y: {
               lower: 0,
@@ -84,7 +96,8 @@ var DataUsageTab = (function() {
         };
         ConfigManager.observe('dataLimit', toggleDataLimit, true);
         ConfigManager.observe('dataLimitValue', setDataLimit, true);
-        ConfigManager.observe('lastDataReset', changeLastReset, true);
+        ConfigManager.observe('lastCompleteDataReset', updateDataUsage, true);
+        ConfigManager.observe('lastDataReset', updateDataUsage, true);
         ConfigManager.observe('nextReset', changeNextReset, true);
 
         initialized = true;
@@ -107,15 +120,39 @@ var DataUsageTab = (function() {
       return;
     }
 
-    document.removeEventListener('mozvisibilitychange', updateWhenVisible);
+    document.removeEventListener('visibilitychange', updateWhenVisible);
     wifiToggle.removeEventListener('click', toggleWifi);
     mobileToggle.removeEventListener('click', toggleMobile);
     ConfigManager.removeObserver('dataLimit', toggleDataLimit);
     ConfigManager.removeObserver('dataLimitValue', setDataLimit);
-    ConfigManager.removeObserver('lastDataReset', changeLastReset);
+    ConfigManager.removeObserver('lastCompleteDataReset', updateDataUsage);
+    ConfigManager.removeObserver('lastDataReset', updateDataUsage);
     ConfigManager.removeObserver('nextReset', changeNextReset);
 
     initialized = false;
+  }
+
+  function resetButtonState() {
+    ConfigManager.requestSettings(Common.dataSimIccId,
+                                  function _onSettings(settings) {
+      var isMobileChartVisible = settings.isMobileChartVisible;
+      if (typeof isMobileChartVisible === 'undefined') {
+        isMobileChartVisible = true;
+      }
+      if (isMobileChartVisible !== mobileToggle.checked) {
+        mobileToggle.checked = isMobileChartVisible;
+        toggleMobile();
+      }
+
+      var isWifiChartVisible = settings.isWifiChartVisible;
+      if (typeof isWifiChartVisible === 'undefined') {
+        isWifiChartVisible = false;
+      }
+      if (isWifiChartVisible !== wifiToggle.checked) {
+        wifiToggle.checked = isWifiChartVisible;
+        toggleWifi();
+      }
+    });
   }
 
   function getLimitInBytes(settings) {
@@ -132,13 +169,14 @@ var DataUsageTab = (function() {
 
   // On visibility change
   function updateWhenVisible(evt) {
-    if (!document.mozHidden) {
+    if (!document.hidden) {
       requestDataUsage();
     }
   }
 
   function requestDataUsage() {
-    ConfigManager.requestSettings(function _onSettings(settings) {
+    ConfigManager.requestSettings(Common.dataSimIccId,
+                                  function _onSettings(settings) {
       var requestObj = { type: 'datausage' };
       costcontrol.request(requestObj, updateCharts);
     });
@@ -146,20 +184,22 @@ var DataUsageTab = (function() {
 
   function updateCharts(result) {
     if (result.status === 'success') {
-      ConfigManager.requestSettings(function _onSettings(settings) {
+      ConfigManager.requestSettings(Common.dataSimIccId,
+                                    function _onSettings(settings) {
         debug('Updating model');
         var modelData = result.data;
         model.data.wifi.samples = modelData.wifi.samples;
         model.data.wifi.total = modelData.wifi.total;
         model.data.mobile.samples = modelData.mobile.samples;
         model.data.mobile.total = modelData.mobile.total;
+        model.limits.enabled = settings.dataLimit;
+        model.limits.value = getLimitInBytes(settings);
         model.axis.X.upper = calculateUpperDate(settings);
         model.axis.X.lower = calculateLowerDate(settings);
         expandModel(model);
 
         debug('Rendering');
         updateUI();
-        checkDataUsageNotification(settings, modelData.mobile.total);
       });
 
     } else {
@@ -183,7 +223,7 @@ var DataUsageTab = (function() {
     updateUI();
   }
 
-  function changeLastReset(value) {
+  function updateDataUsage(value) {
     requestDataUsage();
   }
 
@@ -201,7 +241,7 @@ var DataUsageTab = (function() {
       return new Date(nextReset.getTime() - DAY);
     }
 
-    var lastReset = settings.lastDataReset;
+    var lastReset = settings.lastCompleteDataReset;
     var offset = today.getTime() - lastReset.getTime();
     var upperDate = new Date(lastReset.getTime() + NEVER_PERIOD);
     if (offset >= NEVER_ANCHOR) {
@@ -233,7 +273,7 @@ var DataUsageTab = (function() {
       lowerDate.setYear(newYear);
 
     } else {
-      var lastReset = lowerDate = settings.lastDataReset;
+      var lastReset = lowerDate = settings.lastCompleteDataReset;
       var offset = today.getTime() - lastReset.getTime();
       if (offset >= NEVER_ANCHOR) {
         lowerDate = new Date(today.getTime() - NEVER_ANCHOR);
@@ -257,6 +297,8 @@ var DataUsageTab = (function() {
     var isChecked = wifiToggle.checked;
     wifiLayer.setAttribute('aria-hidden', !isChecked);
     wifiItem.setAttribute('aria-disabled', !isChecked);
+    // save wifi toggled state
+    ConfigManager.setOption({ isWifiChartVisible: isChecked });
   }
 
   // On tapping on mobile toggle
@@ -266,9 +308,14 @@ var DataUsageTab = (function() {
     warningLayer.setAttribute('aria-hidden', !isChecked);
     limitsLayer.setAttribute('aria-hidden', !isChecked);
     mobileItem.setAttribute('aria-disabled', !isChecked);
-    drawBackgroundLayer(model);
-    drawAxisLayer(model);
-    drawLimits(model);
+    // save wifi toggled state
+    ConfigManager.setOption({ isMobileChartVisible: isChecked });
+
+    if (model) {
+      drawBackgroundLayer(model);
+      drawAxisLayer(model);
+      drawLimits(model);
+    }
   }
 
   // Expand the model with some computed values
@@ -353,7 +400,7 @@ var DataUsageTab = (function() {
     var step = model.axis.Y.step;
     var limitY = model.axis.Y.get(model.limits.value);
     ctx.strokeStyle = '#e0e0e0';
-    ctx.lineWidth = 1;
+    ctx.lineWidth = toDevicePixels(1);
     var displayLimit = model.limits.enabled && mobileToggle.checked;
     for (var y = model.originY - step; y > step; y -= step) {
       if (displayLimit && same(y, limitY, 0.1)) {
@@ -370,21 +417,35 @@ var DataUsageTab = (function() {
     var days = (model.axis.X.upper - model.axis.X.lower) / DAY;
     var step = model.axis.X.len / days;
     ctx.strokeStyle = '#eeeeee';
-    ctx.lineWidth = 1;
+    ctx.lineWidth = toDevicePixels(1);
     for (var x = model.originX; x <= model.endX; x += step) {
       var drawX = Math.floor(x) + 0.5;
       ctx.beginPath();
       ctx.moveTo(drawX, model.originY);
       ctx.lineTo(drawX, 0);
       ctx.stroke();
+      // Ensure draw the last vertical line
+      if (((x + step) > model.endX) && (x !== model.endX)) {
+        // the 0.5 offset is needed to avoid drawing a double line.
+        drawX = model.endX - 0.5;
+        ctx.beginPath();
+        ctx.moveTo(drawX, model.originY);
+        ctx.lineTo(drawX, 0);
+        ctx.stroke();
+      }
     }
 
     ctx.restore();
   }
 
+  function makeCSSFontString(fontSize, fontWeight) {
+    return fontWeight + ' ' + fontSize + 'px sans-serif';
+  }
+
   var todayLabel = {};
-  var FONTSIZE = 12;
-  var TODAY_FONTSIZE = 14;
+  var FONTSIZE = toDevicePixels(13);
+  var FONTWEIGHT = '600';
+  var FONTWEIGHT_AXIS = '400'; // normal font weight
   function drawTodayLayer(model) {
     var canvas = document.getElementById('today-layer');
     var height = canvas.height = model.height;
@@ -395,12 +456,12 @@ var DataUsageTab = (function() {
     var offsetX = model.axis.X.get(model.axis.X.today);
 
     // Configure Centered today text
-    var marginTop = 10;
+    var marginTop = toDevicePixels(10);
 
     var todayTag = formatChartDate(model.axis.X.today);
 
     // Render the text
-    ctx.font = '600 ' + TODAY_FONTSIZE + 'px MozTT';
+    ctx.font = makeCSSFontString(FONTSIZE, FONTWEIGHT);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
 
@@ -419,7 +480,7 @@ var DataUsageTab = (function() {
   function formatChartDate(date) {
     return _('verbose-chart-date-format', {
       'monthday-number': date.getDate(),
-      'em-month': _('em-month-' + date.getMonth())
+      'em-month': _('month-' + date.getMonth() + '-short')
     });
   }
 
@@ -434,7 +495,7 @@ var DataUsageTab = (function() {
     var step = model.axis.Y.step;
     var dataStep = model.axis.Y.upper - model.axis.Y.maxValue;
     var offsetX = model.originX - 4, marginBottom = 4;
-    ctx.font = FONTSIZE + 'px MozTT';
+    ctx.font = makeCSSFontString(FONTSIZE, FONTWEIGHT_AXIS);
     ctx.textAlign = 'right';
     var displayLimit = mobileToggle.checked && model.limits.enabled;
     var lastUnit;
@@ -443,14 +504,15 @@ var DataUsageTab = (function() {
 
       // First X label for 0 is aligned with the bottom
       if (value === 0) {
+        lastUnit = smartRound(dataStep, 0)[1];
         ctx.textBaseline = 'bottom';
         ctx.fillStyle = '#6a6a6a';
-        ctx.fillText(formatData(smartRound(0, 0)), offsetX, y - 2.5);
+        ctx.fillText(formatData([0, lastUnit]), offsetX, y - 2.5);
         continue;
       }
 
       // Rest of labels are aligned with the middle
-      var rounded = smartRound(value, 0);
+      var rounded = smartRound(value, -1);
       var v = rounded[0];
       var u = rounded[1];
       var label = v;
@@ -469,11 +531,11 @@ var DataUsageTab = (function() {
 
     // Now the X axis
     ctx.fillStyle = '#6a6a6a';
-    var marginTop = 10;
+    var marginTop = toDevicePixels(10);
 
     // Left tag
     var leftTag = formatChartDate(model.axis.X.lower);
-    ctx.font = '600 ' + FONTSIZE + 'px MozTT';
+    ctx.font = makeCSSFontString(FONTSIZE, FONTWEIGHT);
     ctx.textBaseline = 'top';
     ctx.textAlign = 'start';
 
@@ -515,12 +577,13 @@ var DataUsageTab = (function() {
     var offsetY = set ? model.axis.Y.get(model.limits.value) :
                         FONTSIZE + 2 * marginTop;
 
-    ctx.font = '600 ' + FONTSIZE + 'px MozTT';
+    ctx.font = makeCSSFontString(FONTSIZE, FONTWEIGHT);
 
     // The dashed limit line
-    var lineLength = 15;
-    var gapLength = 7;
+    var lineLength = toDevicePixels(15);
+    var gapLength = toDevicePixels(7);
     ctx.strokeStyle = color;
+    ctx.lineWidth = toDevicePixels(1);
     ctx.beginPath();
     for (var x = model.originX, drawY = Math.floor(offsetY) - 0.5;
          x < model.endX; x += gapLength) {
@@ -546,7 +609,7 @@ var DataUsageTab = (function() {
     // Style
     ctx.fillStyle = '#cbd936';
     ctx.strokeStyle = '#8b9052';
-    ctx.lineWidth = 2;
+    ctx.lineWidth = toDevicePixels(2);
     ctx.moveTo(model.originX, model.originY);
     var today = toMidnight(new Date());
     var sum = 0; var x, y = model.originY;
@@ -582,7 +645,7 @@ var DataUsageTab = (function() {
 
   function drawTodayMark(ctx, x, y, color) {
     ctx.save();
-    var radius = 4;
+    var radius = toDevicePixels(4);
     ctx.fillStyle = color;
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, 2 * Math.PI);
@@ -592,7 +655,7 @@ var DataUsageTab = (function() {
 
   // Check if the segment of the graph is inside chart area. If so, draw it
   function clipAndDrawSegment(ctx, model, x0, y0, x1, y1) {
-    if (x0 >= model.originX && x1 < model.endX) {
+    if (x0 >= model.originX && x1 <= model.endX) {
       var x0Fixed = Math.floor(x0) - 0.5;
       var x1Fixed = Math.floor(x1) + 0.5;
 
@@ -628,7 +691,7 @@ var DataUsageTab = (function() {
 
     ctx.fillStyle = 'rgba(147, 21, 98, 0.7)';
     ctx.strokeStyle = '#762d4a';
-    ctx.lineWidth = 2;
+    ctx.lineWidth = toDevicePixels(2);
 
     var today = toMidnight(new Date());
     var sum = 0; var x, y = model.originY;
